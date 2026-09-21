@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    - 주소: http://{}", addr);
     println!("    - 엔드포인트:");
     println!("      * POST /api/upload         : CSV 데이터셋 업로드");
-    println!("      * POST /api/train          : 1D-CNN / LSTM / CNN+LSTM 원격 학습");
+    println!("      * POST /api/train          : 1D-TCN / 1D-CNN / LSTM / CNN+LSTM 원격 학습");
     println!("      * GET  /api/status         : 학습 진행률 및 상태");
     println!("      * GET  /api/models         : 학습된 모델 목록");
     println!("      * GET  /api/download/:name : .mpk 모델 바이너리 다운로드");
@@ -211,7 +211,7 @@ async fn start_training(
         dataset_path: resolved_dataset.to_string_lossy().to_string(),
         model_arch,
         epochs: payload.epochs.unwrap_or(150),
-        learning_rate: payload.lr.unwrap_or(1e-2),
+        learning_rate: payload.lr.unwrap_or(1e-3),
         batch_size: payload.batch_size.unwrap_or(32),
     };
 

@@ -1,4 +1,6 @@
-use crate::models::{EmgCnnLstmModel, EmgCnnModel, EmgLstmModel, ModelArchitecture};
+use crate::models::{
+    EmgCnnLstmModel, EmgCnnModel, EmgLstmModel, EmgTcnModel, ModelArchitecture,
+};
 use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::record::{CompactRecorder, Recorder};
@@ -11,7 +13,7 @@ use std::io::{self, BufRead, BufReader};
 pub type MyBackend = Wgpu<f32, i32>;
 pub type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
 
-pub const SEQ_LEN: usize = 60;
+pub const SEQ_LEN: usize = 30; // 🚀 시계열 길이를 30(약 0.5초)으로 최적화하여 반응성 향상 및 과거 노이즈 중첩 방지
 pub const NUM_CLASSES: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,9 +29,9 @@ impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
             dataset_path: String::new(),
-            model_arch: ModelArchitecture::Lstm,
+            model_arch: ModelArchitecture::Tcn, // 기본 모델을 1D-TCN으로 설정
             epochs: 150,
-            learning_rate: 1e-2,
+            learning_rate: 1e-3, // 🚀 기본 학습률을 0.001로 안정화
             batch_size: 32,
         }
     }
@@ -45,9 +47,10 @@ pub struct TrainingProgress {
     pub model_file: Option<String>,
 }
 
-/// 데이터셋 CSV 파일에서 특징과 라벨을 파싱하여 반환합니다.
-/// (원시 5채널 CSV 및 FFT가 포함된 45채널 CSV 모두 자동 지원)
-pub fn load_dataset(file_path: &str) -> io::Result<(Vec<Vec<f32>>, Vec<usize>, usize)> {
+/// 데이터셋 CSV 파일에서 특징과 라벨을 파싱하고, Z-Score 표준화(Zero-Centering & Scaling)를 적용합니다.
+pub fn load_dataset(
+    file_path: &str,
+) -> io::Result<(Vec<Vec<f32>>, Vec<usize>, usize, Vec<f32>, Vec<f32>)> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -61,15 +64,17 @@ pub fn load_dataset(file_path: &str) -> io::Result<(Vec<Vec<f32>>, Vec<usize>, u
     if header_cols.len() < 7 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("잘못된 CSV 형식: 최소 7개 이상의 컬럼이 필요합니다. (발견: {})", header_cols.len()),
+            format!(
+                "잘못된 CSV 형식: 최소 7개 이상의 컬럼이 필요합니다. (발견: {})",
+                header_cols.len()
+            ),
         ));
     }
 
-    // 마지막 2개는 label, action_name 이므로 그 앞의 모든 컬럼이 특징임
     let num_features = header_cols.len() - 2;
 
-    let mut all_features = Vec::new();
-    let mut all_labels = Vec::new();
+    let mut raw_features: Vec<Vec<f32>> = Vec::new();
+    let mut all_labels: Vec<usize> = Vec::new();
 
     for line_res in lines {
         let line = line_res?;
@@ -86,19 +91,63 @@ pub fn load_dataset(file_path: &str) -> io::Result<(Vec<Vec<f32>>, Vec<usize>, u
         let mut row_feats = Vec::with_capacity(num_features);
         for i in 0..num_features {
             let val = parts[i].parse::<f32>().unwrap_or(0.0);
-            // 0~1023 범위를 0~1.0 사이로 정규화
-            row_feats.push(val / 1023.0);
+            row_feats.push(val);
         }
 
         let label = parts[num_features].parse::<usize>().unwrap_or(0);
-        all_features.push(row_feats);
+        raw_features.push(row_feats);
         all_labels.push(label);
     }
 
-    Ok((all_features, all_labels, num_features))
+    let total_rows = raw_features.len();
+    if total_rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "유효한 데이터 행이 없습니다.",
+        ));
+    }
+
+    // 🚀 [Z-Score 표준화] 각 특징별 평균(mean) 및 표준편차(std) 계산
+    let mut means = vec![0.0f32; num_features];
+    let mut stds = vec![0.0f32; num_features];
+
+    for row in &raw_features {
+        for k in 0..num_features {
+            means[k] += row[k];
+        }
+    }
+    for k in 0..num_features {
+        means[k] /= total_rows as f32;
+    }
+
+    for row in &raw_features {
+        for k in 0..num_features {
+            let diff = row[k] - means[k];
+            stds[k] += diff * diff;
+        }
+    }
+    for k in 0..num_features {
+        stds[k] = (stds[k] / total_rows as f32).sqrt().max(1e-4);
+    }
+
+    // (x - mean) / std 정규화 적용
+    let mut standardized_features = raw_features;
+    for row in &mut standardized_features {
+        for k in 0..num_features {
+            row[k] = (row[k] - means[k]) / stds[k];
+        }
+    }
+
+    Ok((
+        standardized_features,
+        all_labels,
+        num_features,
+        means,
+        stds,
+    ))
 }
 
-/// 시계열 윈도우(SEQ_LEN: 60)를 생성하여 텐서 입력 데이터로 변환합니다.
+/// 시계열 윈도우(SEQ_LEN: 30)를 생성하여 텐서 입력 데이터로 변환합니다.
 pub fn create_sliding_windows(
     features: &[Vec<f32>],
     labels: &[usize],
@@ -128,7 +177,6 @@ pub fn create_sliding_windows(
 }
 
 /// 지정된 모델 아키텍처에 따라 학습을 수행하고, 저장된 모델 파일 경로를 반환합니다.
-/// progress_callback은 매 에포크마다 현재 진행 상황을 보고받습니다.
 pub fn train_model<F>(
     device: &WgpuDevice,
     config: &TrainingConfig,
@@ -137,7 +185,7 @@ pub fn train_model<F>(
 where
     F: FnMut(TrainingProgress),
 {
-    let (features, labels, feature_dim) = load_dataset(&config.dataset_path)?;
+    let (features, labels, feature_dim, _means, _stds) = load_dataset(&config.dataset_path)?;
     let (flat_inputs, targets, total_samples) =
         create_sliding_windows(&features, &labels, feature_dim);
 
@@ -151,6 +199,11 @@ where
             ),
         ));
     }
+
+    println!(
+        "ℹ️ [학습 데이터셋 구성 완료] 총 윈도우 샘플: {}개 (SEQ_LEN: {}), 특징 차원: {}개 (Z-Score 표준화 적용)",
+        total_samples, SEQ_LEN, feature_dim
+    );
 
     let input_tensor: Tensor<MyAutodiffBackend, 3> =
         Tensor::<MyAutodiffBackend, 1>::from_floats(flat_inputs.as_slice(), device)
@@ -168,6 +221,52 @@ where
 
     // 모델 아키텍처별 분기 학습
     match config.model_arch {
+        ModelArchitecture::Tcn => {
+            let mut model: EmgTcnModel<MyAutodiffBackend> =
+                EmgTcnModel::new(device, feature_dim, NUM_CLASSES);
+            let mut optim = AdamConfig::new().init();
+
+            for epoch in 1..=epochs {
+                let mut total_loss = 0.0;
+                for b in 0..num_batches {
+                    let start = b * batch_size;
+                    let end = std::cmp::min(start + batch_size, total_samples);
+
+                    let batch_input =
+                        input_tensor.clone().slice([start..end, 0..SEQ_LEN, 0..feature_dim]);
+                    let batch_target = target_tensor.clone().slice([start..end]);
+
+                    let output = model.forward(batch_input);
+                    let loss = burn::nn::loss::CrossEntropyLossConfig::new()
+                        .init(&output.device())
+                        .forward(output, batch_target);
+
+                    let loss_item = loss.clone().into_data().to_vec::<f32>().unwrap();
+                    total_loss += loss_item[0];
+
+                    let grads = loss.backward();
+                    let grads_params = GradientsParams::from_grads(grads, &model);
+                    model = optim.step(learning_rate, model, grads_params);
+                }
+
+                let avg_loss = total_loss / num_batches as f32;
+                progress_callback(TrainingProgress {
+                    epoch,
+                    total_epochs: epochs,
+                    loss: avg_loss,
+                    status: "training".to_string(),
+                    model_type: config.model_arch.display_name().to_string(),
+                    model_file: None,
+                });
+            }
+
+            let recorder = CompactRecorder::new();
+            let trained = model.valid();
+            recorder
+                .record(trained.into_record(), model_file_name.into())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("저장 실패: {:?}", e)))?;
+        }
+
         ModelArchitecture::Cnn => {
             let mut model: EmgCnnModel<MyAutodiffBackend> =
                 EmgCnnModel::new(device, feature_dim, NUM_CLASSES);

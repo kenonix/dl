@@ -3,8 +3,8 @@ use burn::record::{CompactRecorder, Recorder};
 use burn::tensor::Tensor;
 use burn_wgpu::WgpuDevice;
 use emg_ml_pipeline::{
-    fft::{EmgFftProcessor, NUM_CHANNELS, TOTAL_FEATURES_WITH_RAW},
-    models::{EmgCnnLstmModel, EmgCnnModel, EmgLstmModel, ModelArchitecture},
+    fft::{EmgFftProcessor, NUM_CHANNELS, TOTAL_FEATURES_ALL, TOTAL_FEATURES_WITH_RAW},
+    models::{EmgCnnLstmModel, EmgCnnModel, EmgLstmModel, EmgTcnModel, ModelArchitecture},
     train::{train_model, MyBackend, TrainingConfig, TrainingProgress, NUM_CLASSES, SEQ_LEN},
 };
 use glob::glob;
@@ -28,11 +28,11 @@ fn main() {
 
     loop {
         println!("\n========================================================");
-        println!(" 🦾 EMG 다중 딥러닝 & FFT 파이프라인 (SEQ_LEN: {})", SEQ_LEN);
+        println!(" 🦾 EMG 고성능 딥러닝 & 지표 추출 파이프라인 (SEQ_LEN: {})", SEQ_LEN);
         println!("========================================================");
-        println!(" 1. 📥 데이터 수집 (센서 원시값 + 실시간 FFT 스펙트럼 동시 저장)");
-        println!(" 2. 🧠 로컬 모델 학습 (1D-CNN / LSTM / CNN+LSTM 선택)");
-        println!(" 3. 🚀 실시간 추론 (선택 모델 로드 & 실시간 FFT 추론)");
+        println!(" 1. 📥 데이터 수집 (원시값 + FFT + Hudgins 4대 지표 동시 저장)");
+        println!(" 2. 🧠 로컬 모델 학습 (1D-TCN / 1D-CNN / LSTM / CNN+LSTM)");
+        println!(" 3. 🚀 실시간 추론 (선택 모델 로드 & 실시간 복합 추론)");
         println!(" 4. 🌐 서버 원격 학습 및 모델 다운로드 (순수 Rust 서버 연동)");
         println!(" 5. 🚪 프로그램 종료");
         print!("메뉴를 선택하세요 (1-5) > ");
@@ -73,9 +73,9 @@ fn main() {
     }
 }
 
-// ==========================================
-// 1. 센서 원시값 + FFT 스펙트럼 동시 수집
-// ==========================================
+// =========================================================================
+// 1. 센서 원시값 + FFT 스펙트럼 + Hudgins 4대 시간 도메인 지표(총 65차원) 동시 수집
+// =========================================================================
 fn run_data_collection() -> io::Result<()> {
     let port_name = "/dev/ttyACM0";
     let baud_rate = 9600;
@@ -93,9 +93,9 @@ fn run_data_collection() -> io::Result<()> {
     );
     let mut csv_file = File::create(&file_name)?;
 
-    // FFT 헤더가 포함된 CSV 헤더 작성 (a0..a4, a0_f1..a4_f8, label, action_name)
+    // 65차원 전체 특징 CSV 헤더 작성 (원시 5 + FFT 40 + Hudgins 20 = 65)
     writeln!(csv_file, "{}", EmgFftProcessor::csv_header())?;
-    println!("저장 파일 생성: {} (특징 45차원: 원시 5 + FFT 40)\n", file_name);
+    println!("저장 파일 생성: {} (특징 총 65차원: 원시 5 + FFT 40 + Hudgins 20)\n", file_name);
 
     let steps = vec![
         ActionStep { name: "휴식 (Relax)", label_id: 0, duration_secs: 7 },
@@ -112,7 +112,7 @@ fn run_data_collection() -> io::Result<()> {
     let mut dummy = String::new();
     io::stdin().read_line(&mut dummy)?;
 
-    let mut fft_processor = EmgFftProcessor::new();
+    let mut processor = EmgFftProcessor::new();
 
     for (idx, step) in steps.iter().enumerate() {
         println!("\n--------------------------------------------------");
@@ -147,7 +147,7 @@ fn run_data_collection() -> io::Result<()> {
                 }
 
                 if !is_recording_started {
-                    println!("\n✔ [순수 데이터 수집 중] 원시 센서값 + FFT 계산 및 기록 시작!");
+                    println!("\n✔ [순수 데이터 수집 중] 원시값 + FFT + Hudgins 65차원 지표 기록 시작!");
                     is_recording_started = true;
                 }
 
@@ -160,11 +160,11 @@ fn run_data_collection() -> io::Result<()> {
                     let mut raw_arr = [0.0f32; NUM_CHANNELS];
                     raw_arr.copy_from_slice(&parts[..NUM_CHANNELS]);
 
-                    // 실시간 FFT 결합 특징 벡터 계산 (45차원)
-                    let combined_features = fft_processor.process_sample_combined(&raw_arr);
+                    // 실시간 원시(5) + FFT(40) + Hudgins(20) = 65차원 통합 산출
+                    let all_features = processor.process_sample_all(&raw_arr);
 
                     let mut row_str = String::new();
-                    for (i, val) in combined_features.iter().enumerate() {
+                    for (i, val) in all_features.iter().enumerate() {
                         if i > 0 {
                             row_str.push(',');
                         }
@@ -174,7 +174,7 @@ fn run_data_collection() -> io::Result<()> {
 
                     csv_file.write_all(row_str.as_bytes())?;
                     print!(
-                        "\r[기록 중] 원시:[{:.0},{:.0},{:.0},{:.0},{:.0}] | FFT 40차원 연산 완료     ",
+                        "\r[기록 중] 원시:[{:.0},{:.0},{:.0},{:.0},{:.0}] | 65차원 지표 연산 완료     ",
                         raw_arr[0], raw_arr[1], raw_arr[2], raw_arr[3], raw_arr[4]
                     );
                     io::stdout().flush()?;
@@ -184,13 +184,13 @@ fn run_data_collection() -> io::Result<()> {
         println!("\n✔ 해당 동작 수집 완료!");
     }
 
-    println!("\n🎉 원시값 + FFT 주파수 스펙트럼 데이터 수집 완료! 파일: {}", file_name);
+    println!("\n🎉 고품질 다차원(65차원) 데이터 수집 완료! 파일: {}", file_name);
     Ok(())
 }
 
-// ==========================================
-// 2. 로컬 모델 학습 (1D-CNN / LSTM / CNN+LSTM)
-// ==========================================
+// =========================================================================
+// 2. 로컬 모델 학습 (1D-TCN / 1D-CNN / LSTM / CNN+LSTM)
+// =========================================================================
 fn run_local_training(device: &WgpuDevice) -> io::Result<()> {
     let mut found_files = Vec::new();
     for entry in glob("emg_dataset_*.csv").expect("Failed glob") {
@@ -226,11 +226,12 @@ fn run_local_training(device: &WgpuDevice) -> io::Result<()> {
     };
 
     println!("\n[학습할 모델 아키텍처 선택]");
-    println!("  [1] 1D-CNN (`EmgCnnModel`)");
-    println!("  [2] LSTM (`EmgLstmModel`)");
-    println!("  [3] CNN + LSTM 복합 (`EmgCnnLstmModel`)");
-    println!("  [4] 3종 모델 모두 순차 학습");
-    print!("선택 (1-4, 기본 2) > ");
+    println!("  [1] 1D-TCN (🥇 추천! Dilated Residual Network)");
+    println!("  [2] 1D-CNN (BatchNorm 적용)");
+    println!("  [3] LSTM");
+    println!("  [4] CNN + LSTM 복합");
+    println!("  [5] 4종 모델 모두 순차 학습");
+    print!("선택 (1-5, 기본 1) > ");
     io::stdout().flush()?;
 
     let mut model_input = String::new();
@@ -238,14 +239,16 @@ fn run_local_training(device: &WgpuDevice) -> io::Result<()> {
     let model_choice = model_input.trim();
 
     let models_to_train = match model_choice {
-        "1" => vec![ModelArchitecture::Cnn],
-        "3" => vec![ModelArchitecture::CnnLstm],
-        "4" => vec![
+        "2" => vec![ModelArchitecture::Cnn],
+        "3" => vec![ModelArchitecture::Lstm],
+        "4" => vec![ModelArchitecture::CnnLstm],
+        "5" => vec![
+            ModelArchitecture::Tcn,
             ModelArchitecture::Cnn,
             ModelArchitecture::Lstm,
             ModelArchitecture::CnnLstm,
         ],
-        _ => vec![ModelArchitecture::Lstm],
+        _ => vec![ModelArchitecture::Tcn],
     };
 
     for arch in models_to_train {
@@ -257,7 +260,7 @@ fn run_local_training(device: &WgpuDevice) -> io::Result<()> {
             dataset_path: dataset_path.to_string_lossy().to_string(),
             model_arch: arch,
             epochs: 150,
-            learning_rate: 1e-2,
+            learning_rate: 1e-3, // 안정화된 0.001 학습률
             batch_size: 32,
         };
 
@@ -282,23 +285,25 @@ fn run_local_training(device: &WgpuDevice) -> io::Result<()> {
     Ok(())
 }
 
-// ==========================================
-// 3. 실시간 추론 (모델 선택 및 실시간 FFT 추론)
-// ==========================================
+// =========================================================================
+// 3. 실시간 추론 (모델 선택 및 실시간 복합 추론)
+// =========================================================================
 fn run_inference_pipeline(device: &WgpuDevice) {
     println!("\n[추론에 사용할 모델 선택]");
-    println!("  [1] 1D-CNN (emg_cnn_model.mpk)");
-    println!("  [2] LSTM (emg_lstm_model.mpk)");
-    println!("  [3] CNN + LSTM (emg_cnnlstm_model.mpk)");
-    print!("선택 (1-3, 기본 2) > ");
+    println!("  [1] 1D-TCN (emg_tcn_model.mpk) [추천]");
+    println!("  [2] 1D-CNN (emg_cnn_model.mpk)");
+    println!("  [3] LSTM (emg_lstm_model.mpk)");
+    println!("  [4] CNN + LSTM (emg_cnnlstm_model.mpk)");
+    print!("선택 (1-4, 기본 1) > ");
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     let arch = match input.trim() {
-        "1" => ModelArchitecture::Cnn,
-        "3" => ModelArchitecture::CnnLstm,
-        _ => ModelArchitecture::Lstm,
+        "2" => ModelArchitecture::Cnn,
+        "3" => ModelArchitecture::Lstm,
+        "4" => ModelArchitecture::CnnLstm,
+        _ => ModelArchitecture::Tcn,
     };
 
     let model_file_name = arch.file_name();
@@ -311,20 +316,43 @@ fn run_inference_pipeline(device: &WgpuDevice) {
         return;
     }
 
-    // 특징 차원 설정 (기본 45: 원시 5 + FFT 40)
-    let feature_dim = TOTAL_FEATURES_WITH_RAW;
+    // 특징 차원 선택 (65차원 전체, 45차원, 5차원)
+    println!("\n[입력 특징 차원 설정]");
+    println!("  [1] 65차원 (원시 5 + FFT 40 + Hudgins 20) [최신 신규]");
+    println!("  [2] 45차원 (원시 5 + FFT 40)");
+    println!("  [3] 5차원 (원시 신호만)");
+    print!("선택 (1-3, 기본 1) > ");
+    io::stdout().flush().unwrap();
+    let mut feat_input = String::new();
+    io::stdin().read_line(&mut feat_input).unwrap();
+    let feature_dim = match feat_input.trim() {
+        "2" => TOTAL_FEATURES_WITH_RAW,
+        "3" => NUM_CHANNELS,
+        _ => TOTAL_FEATURES_ALL,
+    };
 
     println!("\n[알림] 저장된 {} 모델 로드 중 (특징 차원: {})...", arch.display_name(), feature_dim);
     let recorder = CompactRecorder::new();
 
-    // 다형적 모델 래퍼
     enum LoadedModel {
+        Tcn(EmgTcnModel<MyBackend>),
         Cnn(EmgCnnModel<MyBackend>),
         Lstm(EmgLstmModel<MyBackend>),
         CnnLstm(EmgCnnLstmModel<MyBackend>),
     }
 
     let loaded_model = match arch {
+        ModelArchitecture::Tcn => {
+            let mut m = EmgTcnModel::new(device, feature_dim, NUM_CLASSES);
+            match recorder.load(model_file_name.into(), device) {
+                Ok(rec) => m = m.load_record(rec),
+                Err(e) => {
+                    eprintln!("❌ 모델 로드 실패: {:?}", e);
+                    return;
+                }
+            }
+            LoadedModel::Tcn(m)
+        }
         ModelArchitecture::Cnn => {
             let mut m = EmgCnnModel::new(device, feature_dim, NUM_CLASSES);
             match recorder.load(model_file_name.into(), device) {
@@ -385,12 +413,11 @@ fn run_inference_pipeline(device: &WgpuDevice) {
         "3: 엄지 굽히기 (Thumb)",
     ];
 
-    let mut fft_processor = EmgFftProcessor::new();
-    let mut window_buffer: VecDeque<[f32; TOTAL_FEATURES_WITH_RAW]> =
-        VecDeque::with_capacity(SEQ_LEN);
+    let mut processor = EmgFftProcessor::new();
+    let mut window_buffer: VecDeque<Vec<f32>> = VecDeque::with_capacity(SEQ_LEN);
 
     println!("\n==========================================================");
-    println!(" 🚀 {} 실시간 시계열 + FFT 추론 시작! (종료: Ctrl + C)", arch.display_name());
+    println!(" 🚀 {} 실시간 추론 시작! (종료: Ctrl + C)", arch.display_name());
     println!("==========================================================");
 
     loop {
@@ -411,38 +438,43 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                     let mut raw_arr = [0.0f32; NUM_CHANNELS];
                     raw_arr.copy_from_slice(&parts[..NUM_CHANNELS]);
 
-                    // 실시간 FFT 결합 특징 벡터 계산 및 정규화
-                    let combined = fft_processor.process_sample_combined(&raw_arr);
-                    let mut normalized_sample = [0.0f32; TOTAL_FEATURES_WITH_RAW];
-                    for i in 0..TOTAL_FEATURES_WITH_RAW {
-                        normalized_sample[i] = combined[i] / 1023.0;
-                    }
+                    // 설정된 차원에 맞게 특징 벡터 계산
+                    let current_features: Vec<f32> = match feature_dim {
+                        TOTAL_FEATURES_ALL => processor.process_sample_all(&raw_arr).to_vec(),
+                        TOTAL_FEATURES_WITH_RAW => {
+                            processor.process_sample_combined(&raw_arr).to_vec()
+                        }
+                        _ => raw_arr.to_vec(),
+                    };
+
+                    // 간이 온라인 표준화 (대략적인 Z-Score 정규화)
+                    let normalized: Vec<f32> = current_features
+                        .iter()
+                        .map(|&v| (v - 512.0) / 300.0)
+                        .collect();
 
                     if window_buffer.len() == SEQ_LEN {
                         window_buffer.pop_front();
                     }
-                    window_buffer.push_back(normalized_sample);
+                    window_buffer.push_back(normalized);
 
-                    let mut seq_data = Vec::with_capacity(SEQ_LEN * TOTAL_FEATURES_WITH_RAW);
-                    let first_elem = *window_buffer.front().unwrap();
+                    let mut seq_data = Vec::with_capacity(SEQ_LEN * feature_dim);
+                    let first_elem = window_buffer.front().unwrap().clone();
                     for _ in 0..(SEQ_LEN - window_buffer.len()) {
-                        for &v in &first_elem {
-                            seq_data.push(v);
-                        }
+                        seq_data.extend_from_slice(&first_elem);
                     }
                     for sample in &window_buffer {
-                        for &v in sample {
-                            seq_data.push(v);
-                        }
+                        seq_data.extend_from_slice(sample);
                     }
 
                     let input_tensor: Tensor<MyBackend, 3> = Tensor::<MyBackend, 1>::from_floats(
                         seq_data.as_slice(),
                         device,
                     )
-                    .reshape([1, SEQ_LEN, TOTAL_FEATURES_WITH_RAW]);
+                    .reshape([1, SEQ_LEN, feature_dim]);
 
                     let logits = match &loaded_model {
+                        LoadedModel::Tcn(m) => m.forward(input_tensor),
                         LoadedModel::Cnn(m) => m.forward(input_tensor),
                         LoadedModel::Lstm(m) => m.forward(input_tensor),
                         LoadedModel::CnnLstm(m) => m.forward(input_tensor),
@@ -553,27 +585,29 @@ fn run_remote_server_pipeline() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. 서버에서 학습할 모델 선택
     println!("\n[서버에서 학습할 모델 아키텍처 선택]");
-    println!("  [1] 1D-CNN (`cnn`)");
-    println!("  [2] LSTM (`lstm`)");
-    println!("  [3] CNN + LSTM (`cnn_lstm`)");
-    print!("선택 (1-3, 기본 2) > ");
+    println!("  [1] 1D-TCN (🥇 추천! Temporal Convolutional Network) (`tcn`)");
+    println!("  [2] 1D-CNN (`cnn`)");
+    println!("  [3] LSTM (`lstm`)");
+    println!("  [4] CNN + LSTM (`cnn_lstm`)");
+    print!("선택 (1-4, 기본 1) > ");
     io::stdout().flush()?;
 
     let mut model_choice = String::new();
     io::stdin().read_line(&mut model_choice)?;
     let model_type_str = match model_choice.trim() {
-        "1" => "cnn",
-        "3" => "cnn_lstm",
-        _ => "lstm",
+        "2" => "cnn",
+        "3" => "lstm",
+        "4" => "cnn_lstm",
+        _ => "tcn",
     };
 
-    // 5. 서버 학습 시작 요청
-    println!("\n🧠 서버에 원격 학습 시작 요청 중...");
+    // 5. 서버 학습 시작 요청 (기본 lr 0.001)
+    println!("\n🧠 서버에 원격 학습 시작 요청 중 (Learning Rate: 0.001)...");
     let train_req = serde_json::json!({
         "dataset": uploaded_name,
         "model_type": model_type_str,
         "epochs": 150,
-        "lr": 0.01,
+        "lr": 0.001,
         "batch_size": 32
     });
 
@@ -632,7 +666,8 @@ fn run_remote_server_pipeline() -> Result<(), Box<dyn std::error::Error>> {
         match model_type_str {
             "cnn" => "emg_cnn_model.mpk".to_string(),
             "cnn_lstm" => "emg_cnnlstm_model.mpk".to_string(),
-            _ => "emg_lstm_model.mpk".to_string(),
+            "lstm" => "emg_lstm_model.mpk".to_string(),
+            _ => "emg_tcn_model.mpk".to_string(),
         }
     });
 

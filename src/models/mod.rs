@@ -1,10 +1,12 @@
 pub mod cnn;
-pub mod lstm;
 pub mod cnn_lstm;
+pub mod lstm;
+pub mod tcn;
 
 pub use cnn::EmgCnnModel;
-pub use lstm::EmgLstmModel;
 pub use cnn_lstm::EmgCnnLstmModel;
+pub use lstm::EmgLstmModel;
+pub use tcn::EmgTcnModel;
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +16,7 @@ pub enum ModelArchitecture {
     Cnn,
     Lstm,
     CnnLstm,
+    Tcn,
 }
 
 impl ModelArchitecture {
@@ -22,14 +25,16 @@ impl ModelArchitecture {
             Self::Cnn => "emg_cnn_model",
             Self::Lstm => "emg_lstm_model",
             Self::CnnLstm => "emg_cnnlstm_model",
+            Self::Tcn => "emg_tcn_model",
         }
     }
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            Self::Cnn => "1D-CNN",
+            Self::Cnn => "1D-CNN (BatchNorm)",
             Self::Lstm => "LSTM",
             Self::CnnLstm => "CNN + LSTM (CRNN)",
+            Self::Tcn => "1D-TCN (Temporal Convolutional Network)",
         }
     }
 
@@ -38,6 +43,7 @@ impl ModelArchitecture {
             "cnn" | "1d_cnn" | "1dcnn" => Some(Self::Cnn),
             "lstm" => Some(Self::Lstm),
             "cnn_lstm" | "cnnlstm" | "crnn" => Some(Self::CnnLstm),
+            "tcn" | "1d_tcn" | "1dtcn" => Some(Self::Tcn),
             _ => None,
         }
     }
