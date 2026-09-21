@@ -60,12 +60,12 @@
 │ [4. 정규화] Feature-wise Z-Score Standardization (x - μ) / σ                             │
 │        │                                                                                 │
 │        ▼                                                                                 │
-│ [5. 신경망 모델] SE-TCN (Squeeze-and-Excitation Temporal Convolutional Network)           │
+│ [5. 신경망 모델] 1D-TCN (Temporal Convolutional Network)                                 │
 │                • Dilated Conv1d (Dilation: 1, 2, 4 지수적 Receptive Field 확장)          │
-│                • Squeeze-and-Excitation 1D Channel Attention (GAP ➔ MLP ➔ Sigmoid)       │
 │                • Batch Normalization (BatchNorm1d)                                       │
 │                • Residual Shortcut Connection (x + f(x))                                 │
 │                • Spatial/Temporal Dropout (p=0.15)                                       │
+│                • 정적 학습 가중치 (런타임 동적 가중치 제거 ➔ 신뢰도 요동 원천 방지)        │
 │                • Cross-Entropy Loss with Label Smoothing (ε=0.05)                        │
 │        │                                                                                 │
 │        ▼                                                                                 │
@@ -113,10 +113,10 @@
 
 ---
 
-### 2.3 딥러닝 신경망 아키텍처 (SE-TCN Channel Attention)
+### 2.3 딥러닝 신경망 아키텍처 (정적 1D-TCN)
 
-#### 🥇 SE-TCN (Squeeze-and-Excitation 1D-TCN)
-5채널 전극에서 발생하는 75차원 특징 중, 현재 제스처를 판정하는 데 핵심적인 채널과 노이즈가 낀 채널을 신경망 스스로 동적으로 판단하여 가중치를 부여하는 **채널 어텐션(Channel Attention)** 메커니즘이 통합되었습니다.
+#### 🥇 1D-TCN (Temporal Convolutional Network)
+런타임에 입력 신호에 따라 센서 가중치를 동적으로 증감시키는 어텐션 구조를 배제하고, 학습 단계에서 최적화된 **정적 합성곱 커널(Stationary Learned Kernels)과 배치 정규화(BatchNorm)**만을 통과시켜 **프레임 간 신뢰도 요동(Confidence Fluctuation)을 원천 방지**한 고안정 시계열 신경망입니다.
 
 ```
 [입력 텐서: Batch × 75 Features × 30 Seq]
@@ -126,22 +126,23 @@
    │ TcnBlock 1 (d=1, c=32)                                 │
    │  ├─ Conv1d(k=3, pad=1, d=1) ➔ BatchNorm ➔ ReLU ➔ Drop │
    │  ├─ Conv1d(k=3, pad=1, d=1) ➔ BatchNorm ➔ Drop        │
-   │  ├─ 🌟 Squeeze-and-Excitation Block (SE-Block)          │
-   │  │   • Squeeze: Global Average Pooling (GAP) ➔ [B, 32]  │
-   │  │   • Excitation: Linear(32➔8) ➔ ReLU ➔ Linear(8➔32)   │
-   │  │   • Sigmoid ➔ 채널별 중요도 가중치 s ∈ (0, 1)        │
-   │  │   • Rescale: x_scaled = x * s                        │
    │  └─ (+) Residual Shortcut Connection                    │
    └────────────────────────────────────────────────────────┘
                │
                ▼
    ┌────────────────────────────────────────────────────────┐
-   │ TcnBlock 2 (d=2, c=64) + SE-Block (채널 어텐션)         │
+   │ TcnBlock 2 (d=2, c=64)                                 │
+   │  ├─ Conv1d(k=3, pad=2, d=2) ➔ BatchNorm ➔ ReLU ➔ Drop │
+   │  ├─ Conv1d(k=3, pad=2, d=2) ➔ BatchNorm ➔ Drop        │
+   │  └─ (+) 1x1 Conv Shortcut Connection                   │
    └────────────────────────────────────────────────────────┘
                │
                ▼
    ┌────────────────────────────────────────────────────────┐
-   │ TcnBlock 3 (d=4, c=64) + SE-Block (채널 어텐션)         │
+   │ TcnBlock 3 (d=4, c=64)                                 │
+   │  ├─ Conv1d(k=3, pad=4, d=4) ➔ BatchNorm ➔ ReLU ➔ Drop │
+   │  ├─ Conv1d(k=3, pad=4, d=4) ➔ BatchNorm ➔ Drop        │
+   │  └─ (+) Residual Shortcut Connection                    │
    └────────────────────────────────────────────────────────┘
                │
                ▼
@@ -154,11 +155,9 @@
    [Linear(32 ➔ 4)]         ──> 4개 클래스 최종 로짓(Logits)
 ```
 
-- **Squeeze 연산**: 시계열 시간 축 전체를 공간 평균 풀링하여 각 특징 채널의 전역적 에너지 요약 벡터 $z \in \mathbb{R}^C$를 추출합니다:
-  $$z_c = \frac{1}{L} \sum_{t=1}^L x_c(t)$$
-- **Excitation 연산**: 2계층 병목(Bottleneck) MLP와 Sigmoid 활성화를 통해 채널 간 상호 의존성을 학습하고 적응형 가중치 $s$를 생성합니다 (축소비율 $r=4$):
-  $$s = \sigma\left(W_2 \cdot \text{ReLU}(W_1 \cdot z)\right)$$
-- **효과**: 특정 손가락 제스처(예: 엄지 굽히기) 시 작동하는 전극 채널에는 높은 가중치를 부여하고, 땀이나 접촉 불량으로 튀는 전극 신호는 0에 가깝게 감쇠시켜 모델의 노이즈 저항력을 극대화합니다.
+- **정적 가중치 연산의 안정성 (런타임 동적 가중치 배제)**:
+  - 런타임에 센서별 가중치를 동적으로 바꾸는 모듈(SE-Block 등)은 근전도 신호의 20ms 단위 미세한 생체 떨림에 반응하여 채널 가중치가 프레임마다 출렁거리고, 결과적으로 모델 확신도(Confidence)가 널뛰는 원인이 됩니다.
+  - 본 파이프라인은 런타임 동적 가중을 완전히 배제하고, 학습 완료된 고정 가중치와 지수이동평균(EMA)만을 사용하여 **매우 차분하고 일관된 신뢰도**를 산출합니다.
 
 ---
 
@@ -253,7 +252,7 @@ $$\text{Total Features (75)} = \text{Centered Raw (5)} + \text{Detrended FFT (40
 
 | 모델명 | 파일 위치 | 특징 및 구조 |
 | :--- | :--- | :--- |
-| **SE-TCN** (🥇 추천) | [`src/models/tcn.rs`](src/models/tcn.rs) | **Dilated Conv1d(Dilation: 1, 2, 4) + Squeeze-and-Excitation 채널 어텐션 + Residual + BatchNorm1d + Dropout(0.15)**<br>시계열 수용 영역과 채널별 적응형 가중치를 동시 달성하여 노이즈 강건성 극대화 |
+| **1D-TCN** (🥇 추천) | [`src/models/tcn.rs`](src/models/tcn.rs) | **Dilated Conv1d(Dilation: 1, 2, 4) + Residual + BatchNorm1d + Dropout(0.15)**<br>런타임 동적 가중치 요동 없이 일관된 정적 수용 영역 특징 추출로 안정성 극대화 |
 | **1D-CNN** | [`src/models/cnn.rs`](src/models/cnn.rs) | Conv1d + BatchNorm1d + AdaptiveAvgPool1d 기반 경량 합성곱 모델 |
 | **CNN + LSTM** | [`src/models/cnn_lstm.rs`](src/models/cnn_lstm.rs) | 국소적 특징 추출(Conv+BN) 후 순차적 시계열 패턴 학습(LSTM) 결합 |
 | **LSTM** | [`src/models/lstm.rs`](src/models/lstm.rs) | 순수 순환 신경망 구조 |
@@ -266,8 +265,8 @@ $$\text{Total Features (75)} = \text{Centered Raw (5)} + \text{Detrended FFT (40
 - 센서가 피부에서 미세하게 들뜨거나 착용 위치가 바뀌어도 중심화($x - \mu$) 및 차분($x_i - x_{i-1}$) 지표로만 구성되어 있어 베이스라인 전압 변화를 100% 흡수.
 - 학습 시 채널별 베이스라인 시프트($\pm 50$), 가우시안 노이즈, 진폭 스케일링을 자동 주입.
 
-### 2) 2단계: 모델 레벨 (SE Channel Attention & Label Smoothing)
-- 5개 전극 중 신호가 불량한 채널의 가중치를 자동 감쇠(SE-Block).
+### 2) 2단계: 모델 레벨 (Stationary TCN Weights & Label Smoothing)
+- 런타임에 채널 가중치를 건드리지 않는 정적 커널로 예측 신뢰도 흔들림 차단.
 - 라벨 스무딩($\epsilon=0.05$)으로 모델의 과잉 확신을 억제하여 동작 전이 구간의 돌발 오분류 방지.
 
 ### 3) 3단계: 추론 후처리 레벨 (`GestureStabilizer`)
