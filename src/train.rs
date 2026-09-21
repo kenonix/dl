@@ -170,6 +170,40 @@ pub fn load_dataset(
         ));
     }
 
+    // 0번(휴식) 클래스가 2배 녹화(처음과 끝)되어 데이터 편향이 발생하는 문제 자동 균형(Balancing) 보정
+    let mut class_counts = [0usize; NUM_CLASSES];
+    for &(_, label) in &raw_records {
+        if label < NUM_CLASSES {
+            class_counts[label] += 1;
+        }
+    }
+
+    let min_other_count = (1..NUM_CLASSES)
+        .map(|c| class_counts[c])
+        .filter(|&cnt| cnt > 0)
+        .min()
+        .unwrap_or(class_counts[0]);
+
+    let mut balanced_raw_records = Vec::new();
+    let mut c0_seen = 0usize;
+    let c0_stride = if min_other_count > 0 && class_counts[0] >= min_other_count * 2 {
+        2
+    } else {
+        1
+    };
+
+    for &(sample, label) in &raw_records {
+        if label == 0 {
+            c0_seen += 1;
+            if c0_seen % c0_stride == 0 {
+                balanced_raw_records.push((sample, label));
+            }
+        } else {
+            balanced_raw_records.push((sample, label));
+        }
+    }
+    let raw_records = balanced_raw_records;
+
     let mut all_features: Vec<Vec<f32>> = Vec::new();
     let mut all_labels: Vec<usize> = Vec::new();
     let mut rng = SimpleRng::new(20260921);

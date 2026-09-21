@@ -418,10 +418,10 @@ fn run_inference_pipeline(device: &WgpuDevice) {
 
     let mut reader = BufReader::new(port);
     let action_names = [
-        "0: 휴식 (Relax)",
-        "1: 주먹 쥐기 (Fist)",
-        "2: 손가락 펴기 (Open)",
-        "3: 엄지 굽히기 (Thumb)",
+        "휴식 (Relax)",
+        "주먹 쥐기 (Fist)",
+        "손가락 펴기 (Open)",
+        "엄지 굽히기 (Thumb)",
     ];
 
     // 🚀 [1.5초 휴식기 영점 자동 보정]
@@ -505,22 +505,18 @@ impl GestureStabilizer {
             self.ema_probs[0] = 1.0;
         }
 
-        // 1. 스마트 에너지 게이트가 닫힌 경우 (팔에 힘을 뺀 상태)
+        // 1. 순수 신경망 예측 확률 벡터 지수이동평균(EMA) 필터링 (인위적 확률 조작 제거)
+        for i in 0..num_classes {
+            self.ema_probs[i] = self.alpha * raw_probs[i] + (1.0 - self.alpha) * self.ema_probs[i];
+        }
+
+        // 2. 스마트 에너지 게이트 (근육 에너지가 극단적 데드존 미만일 때만 안전하게 휴식으로 분류)
         if is_at_rest {
-            // Rest 확률을 0.95 이상으로 신속히 견인
-            self.ema_probs[0] = self.ema_probs[0] * 0.4 + 0.98 * 0.6;
-            for i in 1..num_classes {
-                self.ema_probs[i] *= 0.4;
-            }
             self.current_stable_gesture = 0;
             self.candidate_gesture = 0;
             self.candidate_count = 0;
-            return (0, self.ema_probs[0], "휴식");
-        }
-
-        // 2. 확률 벡터 지수이동평균(EMA) 필터링
-        for i in 0..num_classes {
-            self.ema_probs[i] = self.alpha * raw_probs[i] + (1.0 - self.alpha) * self.ema_probs[i];
+            let rest_p = self.ema_probs.get(0).copied().unwrap_or(0.0);
+            return (0, rest_p, "휴식");
         }
 
         // 3. 가장 높은 스무딩 확률을 가진 후보 제스처 탐색
@@ -569,6 +565,11 @@ impl GestureStabilizer {
 
         let stable_p = self.ema_probs.get(self.current_stable_gesture).copied().unwrap_or(0.0);
         (self.current_stable_gesture, stable_p, state_tag)
+    }
+
+    /// 각 클래스별 스무딩된 실시간 확률 벡터 반환
+    pub fn get_probabilities(&self) -> &[f32] {
+        &self.ema_probs
     }
 }
 
@@ -619,7 +620,7 @@ impl GestureStabilizer {
                     } else {
                         100.0
                     };
-                    let is_at_rest = total_ac_rms < 75.0;
+                    let is_at_rest = total_ac_rms < 35.0;
 
                     // 🚀 [학습 시와 100% 동일한 정규화 적용]
                     let normalized: Vec<f32> = if let Some(ref stats) = norm_stats {
@@ -676,16 +677,23 @@ impl GestureStabilizer {
                     }
 
                     // 🚀 지능형 제스처 안정화 (확률 EMA + 히스테리시스 락 + 100ms 디바운스)
-                    let (stable_idx, stable_p, state_tag) = stabilizer.update(&raw_probs, is_at_rest);
+                    let (stable_idx, _stable_p, state_tag) = stabilizer.update(&raw_probs, is_at_rest);
+                    let probs = stabilizer.get_probabilities();
+                    let p_relax = probs.get(0).copied().unwrap_or(0.0) * 100.0;
+                    let p_fist  = probs.get(1).copied().unwrap_or(0.0) * 100.0;
+                    let p_open  = probs.get(2).copied().unwrap_or(0.0) * 100.0;
+                    let p_thumb = probs.get(3).copied().unwrap_or(0.0) * 100.0;
 
                     print!(
-                        "\r🤖 [{:<8}] ➔ {:<18} (확신도: {:4.1}%, 상태: {:>2}) | 에너지: {:4.1} | 센서: [{:<18}]",
+                        "\r🤖 [{:<6}] [{:>2}] {:<16} | [휴식:{:4.1}% | 주먹:{:4.1}% | 펴기:{:4.1}% | 엄지:{:4.1}%] | RMS:{:4.1}  ",
                         arch.display_name(),
-                        action_names.get(stable_idx).unwrap_or(&"알 수 없음"),
-                        stable_p * 100.0,
                         state_tag,
+                        action_names.get(stable_idx).unwrap_or(&"알 수 없음"),
+                        p_relax,
+                        p_fist,
+                        p_open,
+                        p_thumb,
                         total_ac_rms,
-                        trimmed
                     );
                     io::stdout().flush().unwrap();
                 }
