@@ -112,7 +112,7 @@ impl SimpleRng {
     }
 }
 
-/// 데이터셋 CSV 파일에서 raw 센서값을 읽어 EmgFftProcessor를 통해 DC-Invariant 65차원 특징을 산출하고,
+/// 데이터셋 CSV 파일에서 raw 센서값을 읽어 EmgFftProcessor를 통해 DC-Invariant 75차원 특징을 산출하고,
 /// 베이스라인 시프트(±50) 및 노이즈/진폭 데이터 증강(Data Augmentation)을 적용한 후 Z-Score 표준화를 수행합니다.
 pub fn load_dataset(
     file_path: &str,
@@ -174,7 +174,7 @@ pub fn load_dataset(
     let mut all_labels: Vec<usize> = Vec::new();
     let mut rng = SimpleRng::new(20260921);
 
-    // 1. 원본 신호 특징 추출 (DC-Invariant 65차원)
+    // 1. 원본 신호 특징 추출 (DC-Invariant 75차원)
     let mut proc_orig = EmgFftProcessor::new();
     for &(sample, label) in &raw_records {
         let feats = proc_orig.process_sample_all(&sample);
@@ -250,8 +250,8 @@ pub fn load_dataset(
     }
 
     println!(
-        "✔ [데이터 로드 & 증강 완료] 원본 {}행 ➔ 증강 후 {}행 (3배 증강, 65차원 DC-Invariant 특징)",
-        total_raw_rows, total_rows
+        "✔ [데이터 로드 & 증강 완료] 원본 {}행 ➔ 증강 후 {}행 (3배 증강, {}차원 DC-Invariant 특징)",
+        total_raw_rows, total_rows, num_features
     );
 
     Ok((
@@ -317,6 +317,10 @@ where
     }
 
     println!(
+        "🎮 [GPU 가속 활성화] WGPU 가속 디바이스: {:?} (Vulkan/NVIDIA 병렬 컴퓨트 파이프라인)",
+        device
+    );
+    println!(
         "ℹ️ [학습 데이터셋 구성 완료] 총 윈도우 샘플: {}개 (SEQ_LEN: {}), 특징 차원: {}개 (Z-Score 표준화 적용)",
         total_samples, SEQ_LEN, feature_dim
     );
@@ -354,6 +358,7 @@ where
 
                     let output = model.forward(batch_input);
                     let loss = burn::nn::loss::CrossEntropyLossConfig::new()
+                        .with_smoothing(Some(0.05))
                         .init(&output.device())
                         .forward(output, batch_target);
 
@@ -400,6 +405,7 @@ where
 
                     let output = model.forward(batch_input);
                     let loss = burn::nn::loss::CrossEntropyLossConfig::new()
+                        .with_smoothing(Some(0.05))
                         .init(&output.device())
                         .forward(output, batch_target);
 
@@ -446,6 +452,7 @@ where
 
                     let output = model.forward(batch_input);
                     let loss = burn::nn::loss::CrossEntropyLossConfig::new()
+                        .with_smoothing(Some(0.05))
                         .init(&output.device())
                         .forward(output, batch_target);
 
@@ -492,6 +499,7 @@ where
 
                     let output = model.forward(batch_input);
                     let loss = burn::nn::loss::CrossEntropyLossConfig::new()
+                        .with_smoothing(Some(0.05))
                         .init(&output.device())
                         .forward(output, batch_target);
 

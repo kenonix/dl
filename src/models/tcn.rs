@@ -5,12 +5,42 @@ use burn::nn::{BatchNorm, BatchNormConfig, Dropout, DropoutConfig, Linear, Linea
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
+/// 1D Squeeze-and-Excitation (SE-Block) 채널 어텐션 모듈
+/// 제스처별로 핵심적인 센서 및 주파수 특징 채널을 모델이 스스로 능동 가중(Attention)
+#[derive(Module, Debug)]
+pub struct SeBlock<B: Backend> {
+    linear1: Linear<B>,
+    linear2: Linear<B>,
+}
+
+impl<B: Backend> SeBlock<B> {
+    pub fn new(device: &B::Device, channels: usize, reduction: usize) -> Self {
+        let reduced = (channels / reduction).max(4);
+        let linear1 = LinearConfig::new(channels, reduced).init(device);
+        let linear2 = LinearConfig::new(reduced, channels).init(device);
+        Self { linear1, linear2 }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch_size, channels, _seq_len] = x.dims();
+        // 1. Squeeze: 시간 차원(dim 2) Global Average Pooling -> [Batch, Channels]
+        let squeeze = x.clone().mean_dim(2).reshape([batch_size, channels]);
+        // 2. Excitation: 채널 간 상관관계 학습 및 Sigmoid 게이트 (0.0 ~ 1.0)
+        let s = burn::tensor::activation::relu(self.linear1.forward(squeeze));
+        let weights = burn::tensor::activation::sigmoid(self.linear2.forward(s))
+            .reshape([batch_size, channels, 1]);
+        // 3. Scale: 원본 피처 맵에 채널별 가중치 곱 적용
+        x * weights
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct TcnBlock<B: Backend> {
     conv1: Conv1d<B>,
     bn1: BatchNorm<B, 1>,
     conv2: Conv1d<B>,
     bn2: BatchNorm<B, 1>,
+    se: SeBlock<B>,
     dropout: Dropout,
     shortcut: Option<Conv1d<B>>,
 }
@@ -35,6 +65,7 @@ impl<B: Backend> TcnBlock<B> {
             .init(device);
         let bn2 = BatchNormConfig::new(out_channels).init(device);
 
+        let se = SeBlock::new(device, out_channels, 4);
         let dropout = DropoutConfig::new(0.15).init();
 
         let shortcut = if in_channels != out_channels {
@@ -52,6 +83,7 @@ impl<B: Backend> TcnBlock<B> {
             bn1,
             conv2,
             bn2,
+            se,
             dropout,
             shortcut,
         }
@@ -66,6 +98,7 @@ impl<B: Backend> TcnBlock<B> {
         let out = burn::tensor::activation::relu(self.bn1.forward(self.conv1.forward(x)));
         let out = self.dropout.forward(out);
         let out = self.bn2.forward(self.conv2.forward(out));
+        let out = self.se.forward(out); // 🚀 1D Squeeze-and-Excitation Channel Attention
         let out = self.dropout.forward(out);
 
         burn::tensor::activation::relu(out + residual)

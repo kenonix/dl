@@ -77,7 +77,7 @@ fn main() {
 }
 
 // =========================================================================
-// 1. 센서 원시값 + FFT 스펙트럼 + Hudgins 4대 시간 도메인 지표(총 65차원) 동시 수집
+// 1. 센서 원시값 + FFT 스펙트럼 + 확장 시간 도메인 6대 지표(총 75차원) 동시 수집
 // =========================================================================
 fn run_data_collection() -> io::Result<()> {
     let port_name = "/dev/ttyACM0";
@@ -96,9 +96,9 @@ fn run_data_collection() -> io::Result<()> {
     );
     let mut csv_file = File::create(&file_name)?;
 
-    // 65차원 전체 특징 CSV 헤더 작성 (원시 5 + FFT 40 + Hudgins 20 = 65)
+    // 75차원 전체 특징 CSV 헤더 작성 (원시 5 + FFT 40 + 시간 도메인 30 = 75)
     writeln!(csv_file, "{}", EmgFftProcessor::csv_header())?;
-    println!("저장 파일 생성: {} (특징 총 65차원: 원시 5 + FFT 40 + Hudgins 20)\n", file_name);
+    println!("저장 파일 생성: {} (특징 총 75차원: 원시 5 + FFT 40 + 시간 도메인 30)\n", file_name);
 
     let steps = vec![
         ActionStep { name: "휴식 (Relax)", label_id: 0, duration_secs: 7 },
@@ -150,7 +150,7 @@ fn run_data_collection() -> io::Result<()> {
                 }
 
                 if !is_recording_started {
-                    println!("\n✔ [순수 데이터 수집 중] 원시값 + FFT + Hudgins 65차원 지표 기록 시작!");
+                    println!("\n✔ [순수 데이터 수집 중] 원시값 + FFT + 확장 시간 도메인 75차원 지표 기록 시작!");
                     is_recording_started = true;
                 }
 
@@ -163,7 +163,7 @@ fn run_data_collection() -> io::Result<()> {
                     let mut raw_arr = [0.0f32; NUM_CHANNELS];
                     raw_arr.copy_from_slice(&parts[..NUM_CHANNELS]);
 
-                    // 실시간 원시(5) + FFT(40) + Hudgins(20) = 65차원 통합 산출
+                    // 실시간 원시(5) + FFT(40) + 시간 도메인(30) = 75차원 통합 산출
                     let all_features = processor.process_sample_all(&raw_arr);
 
                     let mut row_str = String::new();
@@ -177,7 +177,7 @@ fn run_data_collection() -> io::Result<()> {
 
                     csv_file.write_all(row_str.as_bytes())?;
                     print!(
-                        "\r[기록 중] 원시:[{:.0},{:.0},{:.0},{:.0},{:.0}] | 65차원 지표 연산 완료     ",
+                        "\r[기록 중] 원시:[{:.0},{:.0},{:.0},{:.0},{:.0}] | 75차원 지표 연산 완료     ",
                         raw_arr[0], raw_arr[1], raw_arr[2], raw_arr[3], raw_arr[4]
                     );
                     io::stdout().flush()?;
@@ -187,7 +187,7 @@ fn run_data_collection() -> io::Result<()> {
         println!("\n✔ 해당 동작 수집 완료!");
     }
 
-    println!("\n🎉 고품질 다차원(65차원) 데이터 수집 완료! 파일: {}", file_name);
+    println!("\n🎉 고품질 다차원(75차원) 데이터 수집 완료! 파일: {}", file_name);
     Ok(())
 }
 
@@ -319,9 +319,9 @@ fn run_inference_pipeline(device: &WgpuDevice) {
         return;
     }
 
-    // 특징 차원 선택 (65차원 전체, 45차원, 5차원)
+    // 특징 차원 선택 (75차원 전체, 45차원, 5차원)
     println!("\n[입력 특징 차원 설정]");
-    println!("  [1] 65차원 (원시 5 + FFT 40 + Hudgins 20) [최신 신규]");
+    println!("  [1] 75차원 (원시 5 + FFT 40 + 시간 도메인 30) [최신 신규]");
     println!("  [2] 45차원 (원시 5 + FFT 40)");
     println!("  [3] 5차원 (원시 신호만)");
     print!("선택 (1-3, 기본 1) > ");
@@ -465,13 +465,120 @@ fn run_inference_pipeline(device: &WgpuDevice) {
         println!("\nℹ️ [영점 보정 건너뜀] 즉시 추론을 시작합니다.");
     }
 
+/// 🚀 실시간 채터링 및 플리커링을 원천 제거하는 지능형 제스처 안정화 엔진
+/// 1. 확률 지수이동평균(EMA): 확률 벡터 자체를 부드럽게 LPF 필터링
+/// 2. 히스테리시스 락: 신규 제스처 진입 임계치(0.70)와 현재 제스처 유지 임계치(0.40) 분리
+/// 3. 상태 디바운싱: 연속 5프레임(~100ms) 이상 유지 시에만 상태 전이
+pub struct GestureStabilizer {
+    ema_probs: Vec<f32>,
+    current_stable_gesture: usize,
+    candidate_gesture: usize,
+    candidate_count: usize,
+    alpha: f32,            // EMA 갱신 계수 (0.25)
+    enter_threshold: f32,  // 신규 진입 문턱 (70%)
+    hold_threshold: f32,   // 기존 유지 문턱 (40%)
+    debounce_frames: usize,// 디바운스 프레임 수 (5 frames @ 50Hz = 100ms)
+}
+
+impl GestureStabilizer {
+    pub fn new(num_classes: usize) -> Self {
+        let mut init_probs = vec![0.0f32; num_classes];
+        if !init_probs.is_empty() {
+            init_probs[0] = 1.0; // 초기 상태는 Rest
+        }
+        Self {
+            ema_probs: init_probs,
+            current_stable_gesture: 0,
+            candidate_gesture: 0,
+            candidate_count: 0,
+            alpha: 0.25,
+            enter_threshold: 0.70,
+            hold_threshold: 0.40,
+            debounce_frames: 5,
+        }
+    }
+
+    pub fn update(&mut self, raw_probs: &[f32], is_at_rest: bool) -> (usize, f32, &'static str) {
+        let num_classes = raw_probs.len();
+        if self.ema_probs.len() != num_classes {
+            self.ema_probs = vec![0.0; num_classes];
+            self.ema_probs[0] = 1.0;
+        }
+
+        // 1. 스마트 에너지 게이트가 닫힌 경우 (팔에 힘을 뺀 상태)
+        if is_at_rest {
+            // Rest 확률을 0.95 이상으로 신속히 견인
+            self.ema_probs[0] = self.ema_probs[0] * 0.4 + 0.98 * 0.6;
+            for i in 1..num_classes {
+                self.ema_probs[i] *= 0.4;
+            }
+            self.current_stable_gesture = 0;
+            self.candidate_gesture = 0;
+            self.candidate_count = 0;
+            return (0, self.ema_probs[0], "휴식");
+        }
+
+        // 2. 확률 벡터 지수이동평균(EMA) 필터링
+        for i in 0..num_classes {
+            self.ema_probs[i] = self.alpha * raw_probs[i] + (1.0 - self.alpha) * self.ema_probs[i];
+        }
+
+        // 3. 가장 높은 스무딩 확률을 가진 후보 제스처 탐색
+        let mut best_cand = 0;
+        let mut best_p = self.ema_probs[0];
+        for (i, &p) in self.ema_probs.iter().enumerate().skip(1) {
+            if p > best_p {
+                best_p = p;
+                best_cand = i;
+            }
+        }
+
+        // 4. 히스테리시스 및 디바운싱 판단
+        let mut state_tag;
+        if best_cand == self.current_stable_gesture {
+            // 현재 제스처가 여전히 우세함 -> 후보 카운터 리셋
+            self.candidate_gesture = best_cand;
+            self.candidate_count = 0;
+            state_tag = "안정";
+        } else {
+            // 다른 제스처로 전환 시도
+            let current_hold_p = self.ema_probs.get(self.current_stable_gesture).copied().unwrap_or(0.0);
+            
+            // 전이 조건: 새 제스처의 확률이 진입 임계치(70%)를 넘고, 현재 제스처의 확률이 유지 문턱(40%) 아래로 떨어졌을 때
+            if best_p >= self.enter_threshold && current_hold_p < self.hold_threshold {
+                if best_cand == self.candidate_gesture {
+                    self.candidate_count += 1;
+                } else {
+                    self.candidate_gesture = best_cand;
+                    self.candidate_count = 1;
+                }
+                state_tag = "전이";
+
+                // 디바운스 프레임(5프레임 = 100ms) 이상 일관되게 유지되면 최종 상태 전이 확정
+                if self.candidate_count >= self.debounce_frames {
+                    self.current_stable_gesture = best_cand;
+                    self.candidate_count = 0;
+                    state_tag = "확정";
+                }
+            } else {
+                // 불확실하거나 애매한 과도기 구간 -> 이전 안정 제스처를 그대로 락(Lock)
+                self.candidate_count = 0;
+                state_tag = "유지";
+            }
+        }
+
+        let stable_p = self.ema_probs.get(self.current_stable_gesture).copied().unwrap_or(0.0);
+        (self.current_stable_gesture, stable_p, state_tag)
+    }
+}
+
     let mut processor = EmgFftProcessor::new();
     let mut window_buffer: VecDeque<Vec<f32>> = VecDeque::with_capacity(SEQ_LEN);
-    // 🚀 [다수결 스무딩 큐] 최근 9개 프레임(약 0.18초)의 예측을 모아 튀는 현상 방지
-    let mut vote_queue: VecDeque<usize> = VecDeque::with_capacity(9);
+    // 🚀 [지능형 제스처 안정화 엔진] 확률 EMA + 히스테리시스 락 + 100ms 디바운스 필터
+    let mut stabilizer = GestureStabilizer::new(NUM_CLASSES);
 
     println!("\n==========================================================");
-    println!(" 🚀 {} 실시간 추론 시작! (노이즈 게이트 & 다수결 필터 적용 / 종료: Ctrl + C)", arch.display_name());
+    println!(" 🚀 {} 실시간 추론 시작! (확률 EMA & 히스테리시스 락 적용 / 종료: Ctrl + C)", arch.display_name());
     println!("==========================================================");
 
     loop {
@@ -492,7 +599,7 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                     let mut raw_arr = [0.0f32; NUM_CHANNELS];
                     raw_arr.copy_from_slice(&parts[..NUM_CHANNELS]);
 
-                    // 설정된 차원에 맞게 특징 벡터 계산 (DC-Invariant AC 특징)
+                    // 설정된 차원에 맞게 특징 벡터 계산 (75차원 DC-Invariant AC 특징)
                     let current_features: Vec<f32> = match feature_dim {
                         TOTAL_FEATURES_ALL => processor.process_sample_all(&raw_arr).to_vec(),
                         TOTAL_FEATURES_WITH_RAW => {
@@ -558,60 +665,25 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                     // 🚀 Softmax 확률 계산
                     let max_l = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut exp_sum = 0.0f32;
-                    let mut probs = vec![0.0f32; logits_vec.len()];
+                    let mut raw_probs = vec![0.0f32; logits_vec.len()];
                     for (i, &l) in logits_vec.iter().enumerate() {
                         let p = (l - max_l).exp();
-                        probs[i] = p;
+                        raw_probs[i] = p;
                         exp_sum += p;
                     }
-                    for p in &mut probs {
+                    for p in &mut raw_probs {
                         *p /= exp_sum;
                     }
 
-                    let mut frame_max_idx = 0;
-                    let mut frame_max_p = probs[0];
-                    if is_at_rest {
-                        // 근육 활성 에너지가 휴식 임계치 미만이면 노이즈에 의한 오판 방지를 위해 강제 Rest(0) 지정
-                        frame_max_idx = 0;
-                        frame_max_p = probs[0].max(0.95);
-                    } else {
-                        for (i, &p) in probs.iter().enumerate().skip(1) {
-                            if p > frame_max_p {
-                                frame_max_p = p;
-                                frame_max_idx = i;
-                            }
-                        }
-                    }
-
-                    // 🚀 다수결 스무딩 필터 (최근 9개 프레임 다수결)
-                    if vote_queue.len() == 9 {
-                        vote_queue.pop_front();
-                    }
-                    vote_queue.push_back(frame_max_idx);
-
-                    let mut counts = [0usize; NUM_CLASSES];
-                    for &idx in &vote_queue {
-                        if idx < NUM_CLASSES {
-                            counts[idx] += 1;
-                        }
-                    }
-
-                    let mut voted_idx = frame_max_idx;
-                    let mut max_votes = 0;
-                    for (idx, &cnt) in counts.iter().enumerate() {
-                        if cnt > max_votes {
-                            max_votes = cnt;
-                            voted_idx = idx;
-                        }
-                    }
+                    // 🚀 지능형 제스처 안정화 (확률 EMA + 히스테리시스 락 + 100ms 디바운스)
+                    let (stable_idx, stable_p, state_tag) = stabilizer.update(&raw_probs, is_at_rest);
 
                     print!(
-                        "\r🤖 [{:<8}] ➔ {:<18} (신뢰도: {:4.1}%, 안정도: {}/{}) | 에너지: {:4.1} | 센서: [{:<18}]",
+                        "\r🤖 [{:<8}] ➔ {:<18} (확신도: {:4.1}%, 상태: {:>2}) | 에너지: {:4.1} | 센서: [{:<18}]",
                         arch.display_name(),
-                        action_names.get(voted_idx).unwrap_or(&"알 수 없음"),
-                        frame_max_p * 100.0,
-                        max_votes,
-                        vote_queue.len(),
+                        action_names.get(stable_idx).unwrap_or(&"알 수 없음"),
+                        stable_p * 100.0,
+                        state_tag,
                         total_ac_rms,
                         trimmed
                     );
