@@ -47,6 +47,50 @@ pub struct TrainingProgress {
     pub model_file: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NormalizationStats {
+    pub feature_dim: usize,
+    pub means: Vec<f32>,
+    pub stds: Vec<f32>,
+}
+
+impl NormalizationStats {
+    pub fn save(&self, model_name: &str) -> io::Result<()> {
+        let path1 = format!("norm_stats_{}.json", model_name);
+        let f1 = File::create(&path1)?;
+        serde_json::to_writer_pretty(f1, self)?;
+
+        let f2 = File::create("norm_stats.json")?;
+        serde_json::to_writer_pretty(f2, self)?;
+        Ok(())
+    }
+
+    pub fn load_for_model(model_name: &str) -> Option<Self> {
+        let specific_path = format!("norm_stats_{}.json", model_name);
+        if let Ok(f) = File::open(&specific_path) {
+            if let Ok(stats) = serde_json::from_reader(f) {
+                return Some(stats);
+            }
+        }
+        if let Ok(f) = File::open("norm_stats.json") {
+            if let Ok(stats) = serde_json::from_reader(f) {
+                return Some(stats);
+            }
+        }
+        None
+    }
+
+    pub fn normalize(&self, features: &[f32]) -> Vec<f32> {
+        let mut norm = Vec::with_capacity(features.len());
+        for (i, &val) in features.iter().enumerate() {
+            let m = self.means.get(i).copied().unwrap_or(512.0);
+            let s = self.stds.get(i).copied().unwrap_or(300.0);
+            norm.push((val - m) / s);
+        }
+        norm
+    }
+}
+
 /// 데이터셋 CSV 파일에서 특징과 라벨을 파싱하고, Z-Score 표준화(Zero-Centering & Scaling)를 적용합니다.
 pub fn load_dataset(
     file_path: &str,
@@ -185,7 +229,7 @@ pub fn train_model<F>(
 where
     F: FnMut(TrainingProgress),
 {
-    let (features, labels, feature_dim, _means, _stds) = load_dataset(&config.dataset_path)?;
+    let (features, labels, feature_dim, means, stds) = load_dataset(&config.dataset_path)?;
     let (flat_inputs, targets, total_samples) =
         create_sliding_windows(&features, &labels, feature_dim);
 
@@ -404,6 +448,17 @@ where
                 .record(trained.into_record(), model_file_name.into())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("저장 실패: {:?}", e)))?;
         }
+    }
+
+    let stats = NormalizationStats {
+        feature_dim,
+        means,
+        stds,
+    };
+    if let Err(e) = stats.save(model_file_name) {
+        eprintln!("⚠️ 정규화 통계 저장 실패: {:?}", e);
+    } else {
+        println!("✔ [정규화 통계 저장] norm_stats_{}.json 저장 완료 (추론 시 완벽 일치)", model_file_name);
     }
 
     let saved_file = format!("{}.mpk", model_file_name);

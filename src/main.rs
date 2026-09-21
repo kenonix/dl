@@ -5,7 +5,10 @@ use burn_wgpu::WgpuDevice;
 use emg_ml_pipeline::{
     fft::{EmgFftProcessor, NUM_CHANNELS, TOTAL_FEATURES_ALL, TOTAL_FEATURES_WITH_RAW},
     models::{EmgCnnLstmModel, EmgCnnModel, EmgLstmModel, EmgTcnModel, ModelArchitecture},
-    train::{train_model, MyBackend, TrainingConfig, TrainingProgress, NUM_CLASSES, SEQ_LEN},
+    train::{
+        train_model, MyBackend, NormalizationStats, TrainingConfig, TrainingProgress, NUM_CLASSES,
+        SEQ_LEN,
+    },
 };
 use glob::glob;
 use reqwest::blocking::{multipart, Client};
@@ -405,6 +408,14 @@ fn run_inference_pipeline(device: &WgpuDevice) {
         }
     };
 
+    // 학습 시 저장된 Z-Score 정규화 통계 로드
+    let norm_stats = NormalizationStats::load_for_model(model_file_name);
+    if norm_stats.is_some() {
+        println!("✔ [정규화 통계 로드 완료] 학습 당시의 정밀 Z-Score 표준화 적용 (오차 왜곡 제거)");
+    } else {
+        println!("ℹ️ 정규화 통계 파일 없음 (기본 스케일링 모드로 작동)");
+    }
+
     let mut reader = BufReader::new(port);
     let action_names = [
         "0: 휴식 (Relax)",
@@ -415,9 +426,11 @@ fn run_inference_pipeline(device: &WgpuDevice) {
 
     let mut processor = EmgFftProcessor::new();
     let mut window_buffer: VecDeque<Vec<f32>> = VecDeque::with_capacity(SEQ_LEN);
+    // 🚀 [다수결 스무딩 큐] 최근 9개 프레임(약 0.18초)의 예측을 모아 튀는 현상 방지
+    let mut vote_queue: VecDeque<usize> = VecDeque::with_capacity(9);
 
     println!("\n==========================================================");
-    println!(" 🚀 {} 실시간 추론 시작! (종료: Ctrl + C)", arch.display_name());
+    println!(" 🚀 {} 실시간 추론 시작! (다수결 안정화 필터 적용 / 종료: Ctrl + C)", arch.display_name());
     println!("==========================================================");
 
     loop {
@@ -447,11 +460,17 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                         _ => raw_arr.to_vec(),
                     };
 
-                    // 간이 온라인 표준화 (대략적인 Z-Score 정규화)
-                    let normalized: Vec<f32> = current_features
-                        .iter()
-                        .map(|&v| (v - 512.0) / 300.0)
-                        .collect();
+                    // 🚀 [학습 시와 100% 동일한 정규화 적용]
+                    let normalized: Vec<f32> = if let Some(ref stats) = norm_stats {
+                        stats.normalize(&current_features)
+                    } else {
+                        // fallback: 원시값 512 기준, FFT 0 기준
+                        current_features
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v)| if i < 5 { (v - 512.0) / 250.0 } else { v / 50.0 })
+                            .collect()
+                    };
 
                     if window_buffer.len() == SEQ_LEN {
                         window_buffer.pop_front();
@@ -481,19 +500,58 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                     };
 
                     let logits_vec = logits.into_data().to_vec::<f32>().unwrap();
-                    let mut max_idx = 0;
-                    let mut max_val = logits_vec[0];
-                    for (i, &val) in logits_vec.iter().enumerate().skip(1) {
-                        if val > max_val {
-                            max_val = val;
-                            max_idx = i;
+
+                    // 🚀 Softmax 확률 계산
+                    let max_l = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut exp_sum = 0.0f32;
+                    let mut probs = vec![0.0f32; logits_vec.len()];
+                    for (i, &l) in logits_vec.iter().enumerate() {
+                        let p = (l - max_l).exp();
+                        probs[i] = p;
+                        exp_sum += p;
+                    }
+                    for p in &mut probs {
+                        *p /= exp_sum;
+                    }
+
+                    let mut frame_max_idx = 0;
+                    let mut frame_max_p = probs[0];
+                    for (i, &p) in probs.iter().enumerate().skip(1) {
+                        if p > frame_max_p {
+                            frame_max_p = p;
+                            frame_max_idx = i;
+                        }
+                    }
+
+                    // 🚀 다수결 스무딩 필터 (최근 9개 프레임 다수결)
+                    if vote_queue.len() == 9 {
+                        vote_queue.pop_front();
+                    }
+                    vote_queue.push_back(frame_max_idx);
+
+                    let mut counts = [0usize; NUM_CLASSES];
+                    for &idx in &vote_queue {
+                        if idx < NUM_CLASSES {
+                            counts[idx] += 1;
+                        }
+                    }
+
+                    let mut voted_idx = frame_max_idx;
+                    let mut max_votes = 0;
+                    for (idx, &cnt) in counts.iter().enumerate() {
+                        if cnt > max_votes {
+                            max_votes = cnt;
+                            voted_idx = idx;
                         }
                     }
 
                     print!(
-                        "\r🤖 [{:<12} 판정] ➔ {:<22} | 센서값: [{:<18}]",
+                        "\r🤖 [{:<8}] ➔ {:<18} (신뢰도: {:4.1}%, 안정도: {}/{}) | 센서: [{:<18}]",
                         arch.display_name(),
-                        action_names.get(max_idx).unwrap_or(&"알 수 없음"),
+                        action_names.get(voted_idx).unwrap_or(&"알 수 없음"),
+                        frame_max_p * 100.0,
+                        max_votes,
+                        vote_queue.len(),
                         trimmed
                     );
                     io::stdout().flush().unwrap();
@@ -682,9 +740,23 @@ fn run_remote_server_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     let mut dest_file = File::create(&target_model_name)?;
     io::copy(&mut dl_res, &mut dest_file)?;
     println!(
-        "💾 모델 다운로드 성공! 로컬에 저장되었습니다: {}\n이제 [3. 실시간 추론] 메뉴에서 이 모델을 바로 사용할 수 있습니다!",
+        "💾 모델 다운로드 성공! 로컬에 저장되었습니다: {}",
         target_model_name
     );
 
+    // 정규화 통계 파일도 함께 다운로드
+    let base_name = target_model_name.trim_end_matches(".mpk");
+    let stats_name = format!("norm_stats_{}.json", base_name);
+    let stats_url = format!("{}/api/download/{}", server_url, stats_name);
+    if let Ok(mut s_res) = client.get(&stats_url).send() {
+        if s_res.status().is_success() {
+            if let Ok(mut dest_s) = File::create(&stats_name) {
+                let _ = io::copy(&mut s_res, &mut dest_s);
+                println!("✔ 정규화 통계 파일 동시 수신 완료: {}", stats_name);
+            }
+        }
+    }
+
+    println!("\n이제 [3. 실시간 추론] 메뉴에서 이 모델을 바로 사용할 수 있습니다!");
     Ok(())
 }

@@ -12,5 +12,5 @@ pub use models::{
 };
 pub use train::{
     create_sliding_windows, load_dataset, train_model, MyAutodiffBackend, MyBackend,
-    TrainingConfig, TrainingProgress, NUM_CLASSES, SEQ_LEN,
+    NormalizationStats, TrainingConfig, TrainingProgress, NUM_CLASSES, SEQ_LEN,
 };
