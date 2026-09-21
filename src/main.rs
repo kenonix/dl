@@ -424,13 +424,54 @@ fn run_inference_pipeline(device: &WgpuDevice) {
         "3: 엄지 굽히기 (Thumb)",
     ];
 
+    // 🚀 [1.5초 휴식기 영점 자동 보정]
+    println!("\n⚖️ [센서 영점 보정] 팔에 힘을 빼고 편안히 1.5초간 가만히 유지하세요...");
+    let mut baseline_samples: Vec<[f32; NUM_CHANNELS]> = Vec::new();
+    let cal_start = std::time::Instant::now();
+    while baseline_samples.len() < 75 && cal_start.elapsed().as_secs_f32() < 4.0 {
+        let mut cal_line = String::new();
+        if reader.read_line(&mut cal_line).is_ok() {
+            let parts: Vec<f32> = cal_line
+                .trim()
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .collect();
+            if parts.len() == NUM_CHANNELS {
+                let mut arr = [0.0f32; NUM_CHANNELS];
+                arr.copy_from_slice(&parts);
+                baseline_samples.push(arr);
+                if baseline_samples.len() % 15 == 0 {
+                    print!("\r  영점 측정 중... [{:2}/75 샘플]", baseline_samples.len());
+                    io::stdout().flush().unwrap();
+                }
+            }
+        }
+    }
+    let mut rest_baseline = [0.0f32; NUM_CHANNELS];
+    if !baseline_samples.is_empty() {
+        for s in &baseline_samples {
+            for ch in 0..NUM_CHANNELS {
+                rest_baseline[ch] += s[ch];
+            }
+        }
+        for ch in 0..NUM_CHANNELS {
+            rest_baseline[ch] /= baseline_samples.len() as f32;
+        }
+        println!(
+            "\n✔ [영점 보정 완료] 현재 착용 기준선: [Ch0: {:.0}, Ch1: {:.0}, Ch2: {:.0}, Ch3: {:.0}, Ch4: {:.0}]",
+            rest_baseline[0], rest_baseline[1], rest_baseline[2], rest_baseline[3], rest_baseline[4]
+        );
+    } else {
+        println!("\nℹ️ [영점 보정 건너뜀] 즉시 추론을 시작합니다.");
+    }
+
     let mut processor = EmgFftProcessor::new();
     let mut window_buffer: VecDeque<Vec<f32>> = VecDeque::with_capacity(SEQ_LEN);
     // 🚀 [다수결 스무딩 큐] 최근 9개 프레임(약 0.18초)의 예측을 모아 튀는 현상 방지
     let mut vote_queue: VecDeque<usize> = VecDeque::with_capacity(9);
 
     println!("\n==========================================================");
-    println!(" 🚀 {} 실시간 추론 시작! (다수결 안정화 필터 적용 / 종료: Ctrl + C)", arch.display_name());
+    println!(" 🚀 {} 실시간 추론 시작! (노이즈 게이트 & 다수결 필터 적용 / 종료: Ctrl + C)", arch.display_name());
     println!("==========================================================");
 
     loop {
@@ -451,7 +492,7 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                     let mut raw_arr = [0.0f32; NUM_CHANNELS];
                     raw_arr.copy_from_slice(&parts[..NUM_CHANNELS]);
 
-                    // 설정된 차원에 맞게 특징 벡터 계산
+                    // 설정된 차원에 맞게 특징 벡터 계산 (DC-Invariant AC 특징)
                     let current_features: Vec<f32> = match feature_dim {
                         TOTAL_FEATURES_ALL => processor.process_sample_all(&raw_arr).to_vec(),
                         TOTAL_FEATURES_WITH_RAW => {
@@ -459,6 +500,19 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                         }
                         _ => raw_arr.to_vec(),
                     };
+
+                    // 🚀 [스마트 에너지 노이즈 게이트]
+                    // 팔에 힘을 뺀 상태(휴식)에서는 5채널 총 AC-RMS 에너지가 75 미만임
+                    let total_ac_rms = if feature_dim == TOTAL_FEATURES_ALL {
+                        let feats_arr: &[f32; TOTAL_FEATURES_ALL] = current_features
+                            .as_slice()
+                            .try_into()
+                            .unwrap();
+                        EmgFftProcessor::extract_total_ac_rms(feats_arr)
+                    } else {
+                        100.0
+                    };
+                    let is_at_rest = total_ac_rms < 75.0;
 
                     // 🚀 [학습 시와 100% 동일한 정규화 적용]
                     let normalized: Vec<f32> = if let Some(ref stats) = norm_stats {
@@ -516,10 +570,16 @@ fn run_inference_pipeline(device: &WgpuDevice) {
 
                     let mut frame_max_idx = 0;
                     let mut frame_max_p = probs[0];
-                    for (i, &p) in probs.iter().enumerate().skip(1) {
-                        if p > frame_max_p {
-                            frame_max_p = p;
-                            frame_max_idx = i;
+                    if is_at_rest {
+                        // 근육 활성 에너지가 휴식 임계치 미만이면 노이즈에 의한 오판 방지를 위해 강제 Rest(0) 지정
+                        frame_max_idx = 0;
+                        frame_max_p = probs[0].max(0.95);
+                    } else {
+                        for (i, &p) in probs.iter().enumerate().skip(1) {
+                            if p > frame_max_p {
+                                frame_max_p = p;
+                                frame_max_idx = i;
+                            }
                         }
                     }
 
@@ -546,12 +606,13 @@ fn run_inference_pipeline(device: &WgpuDevice) {
                     }
 
                     print!(
-                        "\r🤖 [{:<8}] ➔ {:<18} (신뢰도: {:4.1}%, 안정도: {}/{}) | 센서: [{:<18}]",
+                        "\r🤖 [{:<8}] ➔ {:<18} (신뢰도: {:4.1}%, 안정도: {}/{}) | 에너지: {:4.1} | 센서: [{:<18}]",
                         arch.display_name(),
                         action_names.get(voted_idx).unwrap_or(&"알 수 없음"),
                         frame_max_p * 100.0,
                         max_votes,
                         vote_queue.len(),
+                        total_ac_rms,
                         trimmed
                     );
                     io::stdout().flush().unwrap();

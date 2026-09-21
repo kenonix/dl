@@ -1,7 +1,7 @@
 use burn::module::Module;
 use burn::nn::conv::{Conv1d, Conv1dConfig};
 use burn::nn::pool::{AdaptiveAvgPool1d, AdaptiveAvgPool1dConfig};
-use burn::nn::{BatchNorm, BatchNormConfig, Linear, LinearConfig, PaddingConfig1d};
+use burn::nn::{BatchNorm, BatchNormConfig, Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
@@ -11,6 +11,7 @@ pub struct TcnBlock<B: Backend> {
     bn1: BatchNorm<B, 1>,
     conv2: Conv1d<B>,
     bn2: BatchNorm<B, 1>,
+    dropout: Dropout,
     shortcut: Option<Conv1d<B>>,
 }
 
@@ -34,6 +35,8 @@ impl<B: Backend> TcnBlock<B> {
             .init(device);
         let bn2 = BatchNormConfig::new(out_channels).init(device);
 
+        let dropout = DropoutConfig::new(0.15).init();
+
         let shortcut = if in_channels != out_channels {
             Some(
                 Conv1dConfig::new(in_channels, out_channels, 1)
@@ -49,6 +52,7 @@ impl<B: Backend> TcnBlock<B> {
             bn1,
             conv2,
             bn2,
+            dropout,
             shortcut,
         }
     }
@@ -60,7 +64,9 @@ impl<B: Backend> TcnBlock<B> {
         };
 
         let out = burn::tensor::activation::relu(self.bn1.forward(self.conv1.forward(x)));
+        let out = self.dropout.forward(out);
         let out = self.bn2.forward(self.conv2.forward(out));
+        let out = self.dropout.forward(out);
 
         burn::tensor::activation::relu(out + residual)
     }
@@ -74,6 +80,7 @@ pub struct EmgTcnModel<B: Backend> {
     block3: TcnBlock<B>,
     pool: AdaptiveAvgPool1d,
     linear1: Linear<B>,
+    dropout: Dropout,
     linear2: Linear<B>,
 }
 
@@ -84,6 +91,7 @@ impl<B: Backend> EmgTcnModel<B> {
         let block3 = TcnBlock::new(device, 64, 64, 4);
         let pool = AdaptiveAvgPool1dConfig::new(1).init();
         let linear1 = LinearConfig::new(64, 32).init(device);
+        let dropout = DropoutConfig::new(0.15).init();
         let linear2 = LinearConfig::new(32, num_classes).init(device);
 
         Self {
@@ -92,6 +100,7 @@ impl<B: Backend> EmgTcnModel<B> {
             block3,
             pool,
             linear1,
+            dropout,
             linear2,
         }
     }
@@ -109,8 +118,9 @@ impl<B: Backend> EmgTcnModel<B> {
         // Global Average Pooling
         let x = self.pool.forward(x).reshape([batch_size, 64]);
 
-        // Classification Head
+        // Classification Head with Dropout
         let x = burn::tensor::activation::relu(self.linear1.forward(x));
+        let x = self.dropout.forward(x);
         self.linear2.forward(x)
     }
 }

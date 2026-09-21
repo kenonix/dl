@@ -91,7 +91,29 @@ impl NormalizationStats {
     }
 }
 
-/// 데이터셋 CSV 파일에서 특징과 라벨을 파싱하고, Z-Score 표준화(Zero-Centering & Scaling)를 적용합니다.
+use crate::fft::{EmgFftProcessor, NUM_CHANNELS, TOTAL_FEATURES_ALL};
+
+struct SimpleRng(u64);
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 { 123456789 } else { seed })
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() & 0xFFFFFF) as f32 / 16777216.0
+    }
+    fn range(&mut self, min: f32, max: f32) -> f32 {
+        min + (max - min) * self.next_f32()
+    }
+}
+
+/// 데이터셋 CSV 파일에서 raw 센서값을 읽어 EmgFftProcessor를 통해 DC-Invariant 65차원 특징을 산출하고,
+/// 베이스라인 시프트(±50) 및 노이즈/진폭 데이터 증강(Data Augmentation)을 적용한 후 Z-Score 표준화를 수행합니다.
 pub fn load_dataset(
     file_path: &str,
 ) -> io::Result<(Vec<Vec<f32>>, Vec<usize>, usize, Vec<f32>, Vec<f32>)> {
@@ -115,10 +137,7 @@ pub fn load_dataset(
         ));
     }
 
-    let num_features = header_cols.len() - 2;
-
-    let mut raw_features: Vec<Vec<f32>> = Vec::new();
-    let mut all_labels: Vec<usize> = Vec::new();
+    let mut raw_records: Vec<([f32; NUM_CHANNELS], usize)> = Vec::new();
 
     for line_res in lines {
         let line = line_res?;
@@ -128,34 +147,82 @@ pub fn load_dataset(
         }
 
         let parts: Vec<&str> = trimmed.split(',').map(|s| s.trim()).collect();
-        if parts.len() != header_cols.len() {
+        if parts.len() < 7 {
             continue;
         }
 
-        let mut row_feats = Vec::with_capacity(num_features);
-        for i in 0..num_features {
-            let val = parts[i].parse::<f32>().unwrap_or(0.0);
-            row_feats.push(val);
-        }
+        let ch0 = parts[0].parse::<f32>().unwrap_or(0.0);
+        let ch1 = parts[1].parse::<f32>().unwrap_or(0.0);
+        let ch2 = parts[2].parse::<f32>().unwrap_or(0.0);
+        let ch3 = parts[3].parse::<f32>().unwrap_or(0.0);
+        let ch4 = parts[4].parse::<f32>().unwrap_or(0.0);
+        let raw_sample = [ch0, ch1, ch2, ch3, ch4];
 
-        let label = parts[num_features].parse::<usize>().unwrap_or(0);
-        raw_features.push(row_feats);
-        all_labels.push(label);
+        let label = parts[parts.len() - 2].parse::<usize>().unwrap_or(0);
+        raw_records.push((raw_sample, label));
     }
 
-    let total_rows = raw_features.len();
-    if total_rows == 0 {
+    let total_raw_rows = raw_records.len();
+    if total_raw_rows == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "유효한 데이터 행이 없습니다.",
         ));
     }
 
+    let mut all_features: Vec<Vec<f32>> = Vec::new();
+    let mut all_labels: Vec<usize> = Vec::new();
+    let mut rng = SimpleRng::new(20260921);
+
+    // 1. 원본 신호 특징 추출 (DC-Invariant 65차원)
+    let mut proc_orig = EmgFftProcessor::new();
+    for &(sample, label) in &raw_records {
+        let feats = proc_orig.process_sample_all(&sample);
+        all_features.push(feats.to_vec());
+        all_labels.push(label);
+    }
+
+    // 2. 데이터 증강 1: 착용 위치 변화 모사 (채널별 랜덤 베이스라인 시프트 ±50 + 미세 노이즈)
+    let mut proc_aug1 = EmgFftProcessor::new();
+    let ch_shifts = [
+        rng.range(-50.0, 50.0),
+        rng.range(-50.0, 50.0),
+        rng.range(-50.0, 50.0),
+        rng.range(-50.0, 50.0),
+        rng.range(-50.0, 50.0),
+    ];
+    for &(sample, label) in &raw_records {
+        let mut shifted = [0.0f32; NUM_CHANNELS];
+        for ch in 0..NUM_CHANNELS {
+            let noise = rng.range(-2.5, 2.5);
+            shifted[ch] = sample[ch] + ch_shifts[ch] + noise;
+        }
+        let feats = proc_aug1.process_sample_all(&shifted);
+        all_features.push(feats.to_vec());
+        all_labels.push(label);
+    }
+
+    // 3. 데이터 증강 2: 악력/근육 피로도 모사 (진폭 스케일링 0.85 ~ 1.20)
+    let mut proc_aug2 = EmgFftProcessor::new();
+    let amp_scale = rng.range(0.85, 1.20);
+    for &(sample, label) in &raw_records {
+        let mut scaled = [0.0f32; NUM_CHANNELS];
+        for ch in 0..NUM_CHANNELS {
+            scaled[ch] = sample[ch] * amp_scale;
+        }
+        let feats = proc_aug2.process_sample_all(&scaled);
+        all_features.push(feats.to_vec());
+        all_labels.push(label);
+    }
+
+    let total_rows = all_features.len();
+    let num_features = TOTAL_FEATURES_ALL;
+
     // 🚀 [Z-Score 표준화] 각 특징별 평균(mean) 및 표준편차(std) 계산
     let mut means = vec![0.0f32; num_features];
     let mut stds = vec![0.0f32; num_features];
 
-    for row in &raw_features {
+    for row in &all_features {
         for k in 0..num_features {
             means[k] += row[k];
         }
@@ -164,7 +231,7 @@ pub fn load_dataset(
         means[k] /= total_rows as f32;
     }
 
-    for row in &raw_features {
+    for row in &all_features {
         for k in 0..num_features {
             let diff = row[k] - means[k];
             stds[k] += diff * diff;
@@ -175,12 +242,17 @@ pub fn load_dataset(
     }
 
     // (x - mean) / std 정규화 적용
-    let mut standardized_features = raw_features;
+    let mut standardized_features = all_features;
     for row in &mut standardized_features {
         for k in 0..num_features {
             row[k] = (row[k] - means[k]) / stds[k];
         }
     }
+
+    println!(
+        "✔ [데이터 로드 & 증강 완료] 원본 {}행 ➔ 증강 후 {}행 (3배 증강, 65차원 DC-Invariant 특징)",
+        total_raw_rows, total_rows
+    );
 
     Ok((
         standardized_features,

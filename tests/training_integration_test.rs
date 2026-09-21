@@ -5,7 +5,10 @@ use std::path::Path;
 #[test]
 fn test_train_tcn_and_all_models() {
     let device = WgpuDevice::default();
-    let dataset_path = "emg_dataset_20260919_173715.csv";
+    let mut dataset_path = "emg_dataset_20260921_184801.csv";
+    if !Path::new(dataset_path).exists() {
+        dataset_path = "emg_dataset_20260919_173715.csv";
+    }
 
     if !Path::new(dataset_path).exists() {
         println!("데이터셋 파일이 없어 테스트를 건너뜁니다: {}", dataset_path);
