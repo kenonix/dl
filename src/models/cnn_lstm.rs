@@ -1,8 +1,13 @@
 use burn::module::Module;
 use burn::nn::conv::{Conv1d, Conv1dConfig};
-use burn::nn::{BatchNorm, BatchNormConfig, Linear, LinearConfig, Lstm, LstmConfig, PaddingConfig1d};
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::nn::loss::CrossEntropyLossConfig;
+use burn::nn::{
+    BatchNorm, BatchNormConfig, Linear, LinearConfig, Lstm, LstmConfig, PaddingConfig1d,
+};
+use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::tensor::{Int, Tensor};
+use burn::train::{ClassificationOutput, TrainOutput, TrainStep, ValidStep};
+use crate::train::EmgSeqBatch;
 
 #[derive(Module, Debug)]
 pub struct EmgCnnLstmModel<B: Backend> {
@@ -67,5 +72,31 @@ impl<B: Backend> EmgCnnLstmModel<B> {
         // 4. 분류 헤드
         let x = burn::tensor::activation::relu(self.linear1.forward(last_output));
         self.linear2.forward(x)
+    }
+
+    pub fn forward_classification(
+        &self,
+        inputs: Tensor<B, 3>,
+        targets: Tensor<B, 1, Int>,
+    ) -> ClassificationOutput<B> {
+        let output = self.forward(inputs);
+        let loss = CrossEntropyLossConfig::new()
+            .init(&output.device())
+            .forward(output.clone(), targets.clone());
+
+        ClassificationOutput::new(loss, output, targets)
+    }
+}
+
+impl<B: AutodiffBackend> TrainStep<EmgSeqBatch<B>, ClassificationOutput<B>> for EmgCnnLstmModel<B> {
+    fn step(&self, batch: EmgSeqBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+        let item = self.forward_classification(batch.inputs, batch.targets);
+        TrainOutput::new(self, item.loss.backward(), item)
+    }
+}
+
+impl<B: Backend> ValidStep<EmgSeqBatch<B>, ClassificationOutput<B>> for EmgCnnLstmModel<B> {
+    fn step(&self, batch: EmgSeqBatch<B>) -> ClassificationOutput<B> {
+        self.forward_classification(batch.inputs, batch.targets)
     }
 }

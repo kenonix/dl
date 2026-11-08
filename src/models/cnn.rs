@@ -52,4 +52,42 @@ impl<B: Backend> EmgCnnModel<B> {
         let x = burn::tensor::activation::relu(self.linear1.forward(x));
         self.linear2.forward(x)
     }
+
+    pub fn forward_classification(
+        &self,
+        inputs: Tensor<B, 3>,
+        targets: Tensor<B, 1, burn::tensor::Int>,
+    ) -> burn::train::ClassificationOutput<B> {
+        let output = self.forward(inputs);
+        let loss = burn::nn::loss::CrossEntropyLossConfig::new()
+            .init(&output.device())
+            .forward(output.clone(), targets.clone());
+
+        burn::train::ClassificationOutput::new(loss, output, targets)
+    }
+}
+
+impl<B: burn::tensor::backend::AutodiffBackend>
+    burn::train::TrainStep<crate::train::EmgSeqBatch<B>, burn::train::ClassificationOutput<B>>
+    for EmgCnnModel<B>
+{
+    fn step(
+        &self,
+        batch: crate::train::EmgSeqBatch<B>,
+    ) -> burn::train::TrainOutput<burn::train::ClassificationOutput<B>> {
+        let item = self.forward_classification(batch.inputs, batch.targets);
+        burn::train::TrainOutput::new(self, item.loss.backward(), item)
+    }
+}
+
+impl<B: Backend>
+    burn::train::ValidStep<crate::train::EmgSeqBatch<B>, burn::train::ClassificationOutput<B>>
+    for EmgCnnModel<B>
+{
+    fn step(
+        &self,
+        batch: crate::train::EmgSeqBatch<B>,
+    ) -> burn::train::ClassificationOutput<B> {
+        self.forward_classification(batch.inputs, batch.targets)
+    }
 }

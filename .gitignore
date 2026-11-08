@@ -1,1 +1,7 @@
 /target
+*.log
+model_artifacts/
+mlp/target/
+*.rpm
+.~lock.*#
+

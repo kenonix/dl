@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use burn_wgpu::WgpuDevice;
+use burn::backend::wgpu::WgpuDevice;
 use emg_ml_pipeline::{
     train_model, ModelArchitecture, TrainingConfig, TrainingProgress,
 };
@@ -54,7 +54,7 @@ pub struct AppState {
 #[derive(Debug, Deserialize)]
 pub struct TrainRequest {
     pub dataset: String,
-    pub model_type: String, // "cnn", "lstm", "cnn_lstm"
+    pub model_type: String, // "mlp", "tcn", "cnn", "lstm", "cnn_lstm"
     pub epochs: Option<usize>,
     pub lr: Option<f64>,
     pub batch_size: Option<usize>,
@@ -207,12 +207,29 @@ async fn start_training(
         }
     }
 
+    // 데이터셋의 클래스 수 감지
+    let num_classes = {
+        let mut max_l = 0usize;
+        if let Ok(file) = File::open(&resolved_dataset) {
+            let mut rdr = csv::Reader::from_reader(file);
+            for rec in rdr.records().flatten() {
+                if rec.len() >= 2 {
+                    if let Ok(l) = rec[rec.len() - 2].parse::<usize>() {
+                        max_l = max_l.max(l);
+                    }
+                }
+            }
+        }
+        (max_l + 1).max(2)
+    };
+
     let config = TrainingConfig {
         dataset_path: resolved_dataset.to_string_lossy().to_string(),
         model_arch,
         epochs: payload.epochs.unwrap_or(150),
         learning_rate: payload.lr.unwrap_or(1e-3),
         batch_size: payload.batch_size.unwrap_or(32),
+        num_classes,
     };
 
     // 상태를 "training"으로 초기화
