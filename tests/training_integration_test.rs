@@ -150,7 +150,9 @@ fn test_train_tcn_and_all_models() {
 #[test]
 fn test_train_modular_mlp_model() {
     let device = WgpuDevice::default();
-    let dataset_path = if Path::new("emg_dataset_noise_robust_merged_35d_20261108.csv").exists() {
+    let dataset_path = if Path::new("emg_dataset_noise_robust_20261108_172654_35d.csv").exists() {
+        "emg_dataset_noise_robust_20261108_172654_35d.csv"
+    } else if Path::new("emg_dataset_noise_robust_merged_35d_20261108.csv").exists() {
         "emg_dataset_noise_robust_merged_35d_20261108.csv"
     } else if Path::new("emg_dataset_noise_robust_20261108_102522.csv").exists() {
         "emg_dataset_noise_robust_20261108_102522.csv"
@@ -164,7 +166,7 @@ fn test_train_modular_mlp_model() {
     let config = TrainingConfig {
         dataset_path: dataset_path.to_string(),
         model_arch: ModelArchitecture::ModularMlp,
-        epochs: 15,
+        epochs: 20,
         learning_rate: 1e-3,
         batch_size: 32,
         num_classes: 3,
@@ -185,6 +187,8 @@ fn test_train_modular_mlp_model() {
 
     let mut correct = 0usize;
     let total = valid_dataset.items.len();
+    let mut class_correct = [0usize; 3];
+    let mut class_total = [0usize; 3];
     for item in &valid_dataset.items {
         let input_tensor =
             Tensor::<MyBackend, 1>::from_floats(item.window.as_slice(), &device).reshape([
@@ -194,16 +198,112 @@ fn test_train_modular_mlp_model() {
             ]);
         let logits = model.forward(input_tensor);
         let pred = logits.argmax(1).into_scalar() as usize;
+        if item.label < 3 {
+            class_total[item.label] += 1;
+        }
         if pred == item.label {
             correct += 1;
+            if item.label < 3 {
+                class_correct[item.label] += 1;
+            }
         }
     }
     let acc = (correct as f32 / total.max(1) as f32) * 100.0;
+    // Class 2(지속 주먹 3상 전구간) vs 비수축(Class 0 휴식 + Class 1 잡음) 능동 파지 분리 정확도 산출
+    let mut grasp_correct = 0usize;
+    for item in &valid_dataset.items {
+        let input_tensor =
+            Tensor::<MyBackend, 1>::from_floats(item.window.as_slice(), &device).reshape([
+                1,
+                item.seq_len,
+                item.feature_dim,
+            ]);
+        let logits = model.forward(input_tensor);
+        let pred = logits.argmax(1).into_scalar() as usize;
+        let is_pred_grasp = pred >= 2;
+        let is_true_grasp = item.label >= 2;
+        if is_pred_grasp == is_true_grasp {
+            grasp_correct += 1;
+        }
+    }
+    let grasp_acc = (grasp_correct as f32 / total.max(1) as f32) * 100.0;
+
     println!(
-        "✔ [Block-MLP 격리 검증 결과] 정확도: {:.2}% ({}/{})",
-        acc, correct, total
+        "✔ [Block-MLP 격리 검증 결과] 3클래스 정확도: {:.2}% ({}/{}) | 파지 vs 비수축 이진 분리 정확도: {:.2}% ({}/{}) | Class 0(휴식): {}/{} ({:.1}%) | Class 1(잡음): {}/{} ({:.1}%) | Class 2(지속 주먹 3상 전구간): {}/{} ({:.1}%)",
+        acc,
+        correct,
+        total,
+        grasp_acc,
+        grasp_correct,
+        total,
+        class_correct[0],
+        class_total[0],
+        (class_correct[0] as f32 / class_total[0].max(1) as f32) * 100.0,
+        class_correct[1],
+        class_total[1],
+        (class_correct[1] as f32 / class_total[1].max(1) as f32) * 100.0,
+        class_correct[2],
+        class_total[2],
+        (class_correct[2] as f32 / class_total[2].max(1) as f32) * 100.0,
     );
-    assert!(acc >= 70.0, "Block-MLP valid accuracy too low: {:.2}%", acc);
+    assert!(acc >= 75.0, "Block-MLP valid accuracy too low: {:.2}%", acc);
+    assert!(
+        (class_correct[2] as f32 / class_total[2].max(1) as f32) >= 0.90,
+        "Sustained Fist (Class 2) recall too low"
+    );
+}
+
+#[test]
+fn test_evaluate_saved_modular_mlp_model() {
+    let device = WgpuDevice::default();
+    let dataset_path = "emg_dataset_noise_robust_20261108_172654_35d.csv";
+    if !Path::new(dataset_path).exists() || !Path::new("emg_modular_mlp_model.mpk").exists() {
+        return;
+    }
+
+    let (_, valid_dataset, stats) =
+        load_modular_mlp_dataset(dataset_path, MODULAR_MLP_WINDOW_SIZE).unwrap();
+    let recorder = CompactRecorder::new();
+    let mut model =
+        EmgModularMlpModel::<MyBackend>::new(&device, stats.feature_dim, stats.num_classes);
+    let rec = recorder
+        .load("emg_modular_mlp_model".into(), &device)
+        .unwrap();
+    model = model.load_record(rec);
+
+    let mut conf_mat = [[0usize; 3]; 3];
+    let mut grasp_correct = 0usize;
+    let total = valid_dataset.items.len();
+
+    for item in &valid_dataset.items {
+        let input_tensor =
+            Tensor::<MyBackend, 1>::from_floats(item.window.as_slice(), &device).reshape([
+                1,
+                item.seq_len,
+                item.feature_dim,
+            ]);
+        let logits = model.forward(input_tensor);
+        let pred = logits.argmax(1).into_scalar() as usize;
+        if item.label < 3 && pred < 3 {
+            conf_mat[item.label][pred] += 1;
+        }
+        if (pred >= 2) == (item.label >= 2) {
+            grasp_correct += 1;
+        }
+    }
+
+    let correct = conf_mat[0][0] + conf_mat[1][1] + conf_mat[2][2];
+    let acc = (correct as f32 / total.max(1) as f32) * 100.0;
+    let grasp_acc = (grasp_correct as f32 / total.max(1) as f32) * 100.0;
+    println!("\n=== 📊 [저장된 Physiology-Aware Block-MLP 혼동 행렬 (Confusion Matrix)] ===");
+    println!("  True \\ Pred | Class 0(Rest) | Class 1(Noise) | Class 2(Fist)");
+    println!("  Class 0     | {:13} | {:14} | {:13}", conf_mat[0][0], conf_mat[0][1], conf_mat[0][2]);
+    println!("  Class 1     | {:13} | {:14} | {:13}", conf_mat[1][0], conf_mat[1][1], conf_mat[1][2]);
+    println!("  Class 2     | {:13} | {:14} | {:13}", conf_mat[2][0], conf_mat[2][1], conf_mat[2][2]);
+    println!("  -> 3클래스 정확도: {:.2}% ({}/{})", acc, correct, total);
+    println!("  -> 파지(Fist) vs 비수축(Rest+Noise) 정확도: {:.2}% ({}/{})", grasp_acc, grasp_correct, total);
+    assert!(acc >= 75.0);
+    assert!(grasp_acc >= 94.0);
 }
 
 #[test]

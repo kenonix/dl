@@ -1155,7 +1155,8 @@ pub fn load_modular_mlp_dataset(
                         sf[base_idx] *= scale;
                         sf[base_idx + 1] *= scale;
                         sf[base_idx + 2] *= scale;
-                        sf[base_idx + 5] *= scale;
+                        // ZC (base_idx + 3) 및 SSC (base_idx + 4)는 주파수 영교차/기울기 부호 변화 횟수이므로 진폭 스케일에 불변(Invariant)
+                        sf[base_idx + 5] = (sf[base_idx + 5] * scale.sqrt()).clamp(0.0, 15.0);
                     }
                 }
             } else {
@@ -1168,6 +1169,23 @@ pub fn load_modular_mlp_dataset(
                     }
                 }
             }
+        } else if num_features == 35 {
+            // 🚀 35D (TD_CORE_FEATURES) 생체신호 물리 법칙 준수 스케일링:
+            // - 0..5: 5채널 평활 AC 진폭 -> scale 비례
+            // - 5 + ch*6 + {0(RMS), 1(MAV), 2(WL)}: 진폭 에너지 및 파형 길이 -> scale 비례
+            // - 5 + ch*6 + {3(ZC), 4(SSC)}: 영교차율 및 기울기 부호 반전 횟수 -> 진폭 배율에 불변(Scale-Invariant) 유지!
+            // - 5 + ch*6 + 5(WAMP): 문턱치 초과 횟수 -> 비선형 완만 변동 (sqrt(scale))
+            for ch in 0..5 {
+                sf[ch] *= scale;
+                let base_idx = 5 + ch * 6;
+                if base_idx + 5 < sf.len() {
+                    sf[base_idx] *= scale;     // ac_rms
+                    sf[base_idx + 1] *= scale; // ac_mav
+                    sf[base_idx + 2] *= scale; // wl
+                    // sf[base_idx + 3] (zc) 및 sf[base_idx + 4] (ssc) 불변 유지
+                    sf[base_idx + 5] = (sf[base_idx + 5] * scale.sqrt()).clamp(0.0, 15.0); // wamp
+                }
+            }
         } else {
             for v in &mut sf {
                 *v *= scale;
@@ -1176,28 +1194,23 @@ pub fn load_modular_mlp_dataset(
         sf
     };
 
+    // 원시 특징 프레임에서 5채널 총합 RMS 에너지를 추출하는 헬퍼 클로저
+    let frame_total_rms = |frame: &[f32]| -> f32 {
+        if num_features >= 75 {
+            (0..5).map(|ch| frame[45 + ch * 6]).sum()
+        } else if num_features == 35 {
+            (0..5).map(|ch| frame[5 + ch * 6]).sum()
+        } else {
+            frame.iter().take(5).copied().sum()
+        }
+    };
+
     for (label, block) in &contiguous_blocks {
         if block.len() < window_size {
             continue;
         }
         let norm_block: Vec<Vec<f32>> = block.iter().map(|f| stats.normalize(f)).collect();
         let num_wins = norm_block.len() - window_size + 1;
-
-        // 🚀 클래스 경계 보존형 진폭 증강 (Boundary-Preserving Scale Augmentation):
-        // 기존에 주먹(Label 2)을 0.88배로 축소 증강하면 주먹 진폭(294 * 0.88 = 258)이 동적 잡음(234~255) 구간과
-        // 완전히 겹쳐서 추론 시 주먹과 동적 잡음을 왔다 갔다 하는 라벨 충돌(Label Collision)이 발생했습니다.
-        // 이를 방지하기 위해 휴식은 하향 안정화, 잡음은 미세 변동, 주먹은 수축 방향(>= 1.02배)으로만 증강합니다.
-        let aug_scales: [f32; 2] = if num_classes == 3 {
-            match *label {
-                0 => [0.92, 0.98], // 정적 휴식: 저에너지 영역 유지
-                1 => [0.97, 1.02], // 동적 잡음: 주먹 영역 침범 차단
-                _ => [1.02, 1.12], // 진짜 주먹: 잡음 영역으로의 하향 침범(0.88배) 원천 차단
-            }
-        } else if *label >= 1 {
-            [1.02, 1.12]
-        } else {
-            [0.93, 0.98]
-        };
 
         // 🚀 [무중복 검증 아일랜드 분할 (Non-overlapping Validation Islands with Purge Gap)]
         // 기존의 꼬리 20% 분할은 사용자의 6초 수축 말기 근피로/조기이완(Fatigue decay) 데이터만 검증셋에 몰려
@@ -1240,7 +1253,40 @@ pub fn load_modular_mlp_dataset(
                 let overlaps = islands.iter().any(|&(is_s, is_e)| !(end_idx <= is_s || start_idx >= is_e));
                 if !overlaps {
                     train_windows.push(base_item);
-                    // 학습 윈도우에 대해서만 균등 진폭 다변화 증강 추가 (클래스 1:1:1 밸런스 유지)
+
+                    // 🚀 생체역학적 3상 등척성 피로 시뮬레이션 증강 (Isometric Fatigue & Boundary-Preserving Augmentation):
+                    // - 휴식(0) 및 동적 잡음(1): 주먹 영역으로 침범하지 않도록 보수적 범위 내에서 증강
+                    // - 수축 동작(>=2): 윈도우의 평균 총합 RMS가 고진폭(Phase 1 초기 동원 > 210)일 때는 0.65배 감쇠 증강을 통해
+                    //   5채널 근육 공간 협응 비율(Spatial Synergy Ratio)과 주파수(ZC/SSC)는 그대로 유지하면서
+                    //   Phase 2 등척성 진폭 감쇠 구간(RMS 140~220)의 학습 밀도를 2배로 보강합니다.
+                    //   반대로 이미 감쇠된 Phase 2 저진폭 구간(<= 210)은 잡음 영역(< 100)과 충돌하지 않도록 [0.92, 1.15]로 보호합니다.
+                    let win_mean_rms: f32 = (start_idx..end_idx)
+                        .map(|t| frame_total_rms(&block[t]))
+                        .sum::<f32>()
+                        / (window_size as f32);
+
+                    let aug_scales: [f32; 2] = if num_classes >= 3 {
+                        match *label {
+                            0 => [0.92, 0.98], // 정적 휴식: 저에너지 영역 유지
+                            1 => [0.96, 1.02], // 동적 잡음: 주먹 영역 침범 차단
+                            _ => {
+                                if win_mean_rms > 210.0 {
+                                    [0.65, 1.12] // Phase 1 고진폭 -> Phase 2 등척성 감쇠(0.65x) 및 강수축(1.12x) 동시 모사
+                                } else {
+                                    [0.92, 1.15] // Phase 2/3 중저진폭 -> 잡음 충돌 방지 및 수축 복원력 강화
+                                }
+                            }
+                        }
+                    } else if *label >= 1 {
+                        if win_mean_rms > 210.0 {
+                            [0.65, 1.12]
+                        } else {
+                            [0.92, 1.15]
+                        }
+                    } else {
+                        [0.93, 0.98]
+                    };
+
                     for &scale in &aug_scales {
                         let mut aug_win = Vec::with_capacity(window_size * num_features);
                         for t in start_idx..end_idx {
@@ -1341,7 +1387,7 @@ where
         let _ = std::fs::create_dir_all(artifacts_dir);
     }
 
-    let epochs = if config.epochs == 150 || config.epochs == 25 { 10 } else { config.epochs };
+    let epochs = if config.epochs == 150 || config.epochs == 25 { 20 } else { config.epochs };
     let model_file_name = config.model_arch.file_name();
 
     // 기능 7.2 & 7.3: 분리된 가중치 감쇠(AdamW) 및 선형 웜업 결합 코사인 어닐링 스케줄러 구성

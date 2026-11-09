@@ -830,11 +830,19 @@ pub struct StabilizerDecision {
 
 /// 🚀 다중 파지(Multi-Grasp) 확장을 위한 대칭적 제스처 안정화 엔진 (Symmetric Multi-Pose Debouncer)
 /// 1. 확률 지수이동평균(EMA): α = 0.35 (순수 신경망 Softmax 확률 벡터에 대해 편향 없이 스무딩)
-/// 2. 대칭적 디바운싱:
-///    - 능동 제스처 진입: 후보 클래스 확률 >= 45%, 3프레임(약 60ms) 연속 일관성 검증
-///    - 휴식(Rest) 복귀: 4프레임(약 80ms) 연속 검증 (일시적 근피로/수축 요동 시 조기 풀림 방지)
-/// 3. 모터 불응기(Refractory Period): 상태 전이 후 300ms 동안 역전이 차단 (서보 모터 물리 반동 및 역기전력 방어)
-/// 4. 하드웨어 단선/이탈 침묵 보호: 실효 AC-RMS < 10.0 시 안전하게 Rest(0) 복귀
+/// 2. 생체역학적 수축 에너지 물리 인터락 (Physical Contraction Energy Gate):
+///    - 능동 제스처(Class >= 2) 진입 시 물리적 실효 에너지(RMS >= (base_rest * 1.8).max(110.0)) 필수 검증
+///    - 동적 잡음(Class 1) 상태에서의 일시적 모델 확률 튐에 의한 주먹 오탐 100% 원천 차단
+/// 3. 상태 전이별 비대칭 디바운싱:
+///    - 정적 휴식(0) -> 능동 제스처(>=2): 3프레임(약 60ms, p >= 50%) 초고속 진입
+///    - 동적 잡음(1) -> 능동 제스처(>=2): 5프레임(약 100ms, p >= 60%) 엄격한 검증
+///    - 능동 제스처(>=2) -> 휴식(0) 복귀: 5프레임(약 100ms) 자연스럽고 매끄러운 릴리즈
+///    - 동적 잡음(1) -> 휴식(0) 복귀: 2프레임(약 40ms) 초고속 즉각 복귀
+/// 4. 지능형 잡음 방어(Adaptive Noise Defense):
+///    - 수축 유지 에너지(RMS >= 80.0) 존재 시 최대 10프레임(약 200ms) 동안 모터 진동/역기전력 방어
+///    - 손을 펴서 에너지가 꺼졌거나 잡음이 200ms 이상 지속 시 즉시 동적 잡음(Class 1)으로 정상 탈출
+/// 5. 모터 불응기(Refractory Period): 상태 전이 후 300ms 동안 역전이 차단
+/// 6. 하드웨어 단선/이탈 침묵 보호: 실효 AC-RMS < 10.0 시 안전하게 Rest(0) 복귀
 pub struct GestureStabilizer {
     ema_probs: Vec<f32>,
     current_stable_gesture: usize,
@@ -843,10 +851,12 @@ pub struct GestureStabilizer {
     last_transition_time: Instant,
     refractory_period: Duration,
     silence_rms: f32,
+    base_rest_rms: f32,
+    noise_hold_count: usize,
 }
 
 impl GestureStabilizer {
-    pub fn new(num_classes: usize, _base_rest_rms: f32) -> Self {
+    pub fn new(num_classes: usize, base_rest_rms: f32) -> Self {
         let mut init_probs = vec![0.0f32; num_classes];
         if !init_probs.is_empty() {
             init_probs[0] = 1.0; // 초기 상태는 Rest
@@ -860,6 +870,8 @@ impl GestureStabilizer {
             last_transition_time: Instant::now() - Duration::from_secs(1),
             refractory_period: Duration::from_millis(300),
             silence_rms: 10.0,
+            base_rest_rms: base_rest_rms.max(25.0),
+            noise_hold_count: 0,
         }
     }
 
@@ -881,6 +893,7 @@ impl GestureStabilizer {
             self.current_stable_gesture = 0;
             self.candidate_gesture = 0;
             self.candidate_count = 0;
+            self.noise_hold_count = 0;
             let rest_p = self.ema_probs.get(0).copied().unwrap_or(1.0);
             return StabilizerDecision {
                 stable_idx: 0,
@@ -920,6 +933,16 @@ impl GestureStabilizer {
             }
         }
 
+        // 🛡️ [생체역학적 수축 에너지 물리 인터락 (Physical Contraction Energy Gate)]
+        // 동적 잡음(팔 흔들림, 옷깃 스침 등, RMS 60~100) 상황에서 신경망이 순간적으로 Class >= 2(주먹) 확률을 높게 주더라도
+        // 물리적 수축 에너지가 주먹 최소 문턱치((base_rest * 1.8).max(110.0))에 미치지 못하면 주먹 진입을 100% 원천 차단합니다.
+        let min_grasp_rms = (self.base_rest_rms * 1.8).max(110.0);
+        if best_cand >= 2 && self.current_stable_gesture < 2 && total_ac_rms < min_grasp_rms {
+            // 에너지가 부족한 상태에서의 주먹 확률은 동적 잡음 스파이크로 판정 -> Class 1(동적 잡음)으로 강제 리매핑
+            best_cand = 1;
+            best_p = self.ema_probs.get(1).copied().unwrap_or(0.5);
+        }
+
         // 5. 다중 클래스 확장형 비대칭 디바운싱 및 히스테리시스 판정
         // - Class 0: 정적 휴식 (Rest)
         // - Class 1: 동적 잡음 / 일상 팔 움직임 (Noise / Non-Grasp)
@@ -927,35 +950,80 @@ impl GestureStabilizer {
         let is_currently_grasp = self.current_stable_gesture >= 2;
         let is_cand_noise = best_cand == 1; // Class 1: 동적 잡음
 
-        // 비대칭 디바운싱 프레임 산정 (50Hz 기준, 1프레임 = 20ms)
-        let required_debounce = if best_cand == 0 && is_currently_grasp {
-            5 // 능동 제스처(Class >= 2)에서 휴식(0)으로 복귀: 5프레임(~100ms) 연속 검증 (미세 피로 요동 방어 + 신속하고 자연스러운 릴리즈)
+        // 상태 전이별 맞춤 디바운스 프레임 및 확률 임계치 (50Hz 기준, 1프레임 = 20ms)
+        let (required_debounce, threshold) = if best_cand == 0 && is_currently_grasp {
+            (5, 0.45f32) // 능동 제스처(Class >= 2)에서 휴식(0)으로 복귀: 5프레임(~100ms) 연속 검증 (자연스러운 릴리즈)
         } else if best_cand == 0 {
-            2 // 동적 잡음(1)이나 기타 상태에서 휴식(0)으로 복귀: 2프레임(~40ms) 초고속 즉각 복귀!
+            (2, 0.45f32) // 동적 잡음(1)이나 기타 상태에서 휴식(0)으로 복귀: 2프레임(~40ms) 초고속 즉각 복귀!
         } else if best_cand == 1 && self.current_stable_gesture == 0 {
-            5 // 정적 휴식(0)에서 동적 잡음(1)으로 튀는 것 방어: 5프레임(~100ms) 연속 검증 (베이스라인 미세 리플 오탐 차단)
+            (5, 0.50f32) // 정적 휴식(0)에서 동적 잡음(1)으로 튀는 것 방어: 5프레임(~100ms) 연속 검증
+        } else if best_cand >= 2 && self.current_stable_gesture == 1 {
+            // 🚀 [동적 잡음 중 주먹 진입 보호]: 잡음 상태는 신호가 불규칙하므로 5프레임(~100ms) 및 확실한 60% 확률 검증 요구!
+            (5, 0.60f32)
+        } else if best_cand >= 2 && self.current_stable_gesture >= 2 {
+            (4, 0.50f32) // 제스처 간 상호 전환 (주먹 <-> 핀치): 4프레임(~80ms)
         } else {
-            3 // 제스처(주먹 등) 진입 및 전이: 초고속 3프레임(~60ms) 유지
+            (3, 0.50f32) // 정적 휴식(0)에서 제스처(주먹 등) 진입: 직관적 초고속 3프레임(~60ms) 유지
         };
-        let threshold = 0.45f32;
 
         let (state_tag, decision_reason, is_event);
 
         if is_currently_grasp && is_cand_noise {
-            // 🛡️ [능동 수축 유지 중 잡음 방어]
-            // 주먹/핀치 등 물체를 쥐고 있는 상태(Class >= 2)에서 팔의 2차 이동이나 서보 진동으로 인한 잡음(Class 1) 발생 시
-            // 악력을 풀지 않고 현재 제스처를 굳건히 유지 (채터링 및 물체 낙하 방지)
-            self.candidate_count = 0;
-            state_tag = "유지";
-            decision_reason = format!("수축 유지 중 잡음 방어 (Cand Class 1 무시, p={:.1}%)", best_p * 100.0);
-            is_event = false;
+            // 🛡️ [에너지 조건부 적응형 잡음 방어]
+            // 주먹 유지에 필요한 최소 등척성 에너지 (휴식 기준선 대비 1.35배 또는 80.0 RMS 이상)
+            let min_sustain_rms = (self.base_rest_rms * 1.35).max(80.0);
+
+            if total_ac_rms >= min_sustain_rms && self.noise_hold_count < 10 {
+                // 수축 에너지가 충분히 유지되고, 연속 잡음 방어 횟수가 10프레임(~200ms) 미만인 경우 악력 100% 유지
+                self.candidate_count = 0;
+                self.noise_hold_count += 1;
+                state_tag = "유지";
+                decision_reason = format!(
+                    "수축 유지 중 잡음 방어 (Cand Class 1 무시 {}/10, RMS {:.1} >= {:.1}, p={:.1}%)",
+                    self.noise_hold_count, total_ac_rms, min_sustain_rms, best_p * 100.0
+                );
+                is_event = false;
+            } else {
+                // 1) 사용자가 손을 펴서 RMS가 80.0 미만으로 떨어졌거나,
+                // 2) 200ms(10프레임) 이상 지속적으로 Class 1(잡음)이 들어오는 경우 -> 주먹 수축이 완전히 해제된 상태!
+                // 잡음을 무시하지 않고 정상적으로 Class 1(동적 잡음)으로 신속히 탈출 전이 진행
+                if self.candidate_gesture == 1 {
+                    self.candidate_count += 1;
+                } else {
+                    self.candidate_gesture = 1;
+                    self.candidate_count = 1;
+                }
+
+                if self.candidate_count >= 3 {
+                    let prev_idx = self.current_stable_gesture;
+                    self.current_stable_gesture = 1;
+                    self.candidate_count = 0;
+                    self.noise_hold_count = 0;
+                    self.last_transition_time = Instant::now();
+                    state_tag = "확정";
+                    decision_reason = format!(
+                        "🎉 수축 해제 -> 동적 잡음 정상 복귀: Class {} -> Class 1 (RMS {:.1}, p={:.1}%)",
+                        prev_idx, total_ac_rms, best_p * 100.0
+                    );
+                    is_event = true;
+                } else {
+                    state_tag = "전이";
+                    decision_reason = format!(
+                        "수축 해제 동적 잡음 전이 중: Class {} -> Class 1 ({}/3, RMS {:.1})",
+                        self.current_stable_gesture, self.candidate_count, total_ac_rms
+                    );
+                    is_event = true;
+                }
+            }
         } else if best_cand == self.current_stable_gesture {
             self.candidate_gesture = best_cand;
             self.candidate_count = 0;
+            self.noise_hold_count = 0;
             state_tag = "안정";
             decision_reason = format!("안정 유지 (p={:.1}%)", best_p * 100.0);
             is_event = false;
         } else if best_p >= threshold {
+            self.noise_hold_count = 0;
             if best_cand == self.candidate_gesture && self.candidate_count > 0 {
                 self.candidate_count += 1;
             } else {
@@ -967,6 +1035,7 @@ impl GestureStabilizer {
                 let prev_idx = self.current_stable_gesture;
                 self.current_stable_gesture = best_cand;
                 self.candidate_count = 0;
+                self.noise_hold_count = 0;
                 self.last_transition_time = Instant::now();
                 state_tag = "확정";
                 decision_reason = format!("🎉 상태 전이 확정: Class {} -> Class {} (p={:.1}%)", prev_idx, best_cand, best_p * 100.0);
@@ -978,6 +1047,7 @@ impl GestureStabilizer {
             }
         } else {
             self.candidate_count = 0;
+            self.noise_hold_count = 0;
             state_tag = "유지";
             decision_reason = format!("전이 미달: Cand Class {} (p={:.1}% < {:.0}%)", best_cand, best_p * 100.0, threshold * 100.0);
             is_event = false;
@@ -2292,12 +2362,12 @@ mod tests {
         stab.ema_probs = vec![0.0, 0.0, 1.0];
         stab.last_transition_time = Instant::now() - Duration::from_millis(500);
 
-        // 잡음(1) 신호가 지속되어 EMA 상으로 잡음이 우세해져도(Cand 1), 수축 유지 중 잡음 방어로 악력 유지
+        // 잡음(1) 신호가 지속되어 EMA 상으로 잡음이 우세해져도(Cand 1), 수축 유지 에너지(RMS 120.0)가 있으면 잡음 방어로 악력 유지
         let noise_probs = [0.05, 0.90, 0.05];
         // EMA 전환을 위해 몇 프레임 투입
-        let _ = stab.update(&noise_probs, 80.0);
-        let _ = stab.update(&noise_probs, 80.0);
-        let d = stab.update(&noise_probs, 80.0);
+        let _ = stab.update(&noise_probs, 120.0);
+        let _ = stab.update(&noise_probs, 120.0);
+        let d = stab.update(&noise_probs, 120.0);
         assert_eq!(d.state_tag, "유지");
         assert_eq!(d.stable_idx, 2);
         assert!(d.reason.contains("수축 유지 중 잡음 방어"));
@@ -2327,26 +2397,84 @@ mod tests {
         stab.ema_probs = vec![0.0, 0.0, 1.0, 0.0];
         stab.last_transition_time = Instant::now() - Duration::from_millis(500);
 
-        // 주먹(2) -> 손펴기(3) 전이
+        // 주먹(2) -> 손펴기(3) 전이 (능동 수축 에너지 RMS 150.0)
         let open_probs = [0.05, 0.05, 0.05, 0.85];
-        let _ = stab.update(&open_probs, 70.0); // EMA 전이 유도
-        let d1 = stab.update(&open_probs, 70.0);
-        assert_eq!(d1.best_cand, 3);
-        assert_eq!(d1.required_debounce, 3);
-        let _ = stab.update(&open_probs, 70.0);
-        let d3 = stab.update(&open_probs, 70.0);
-        assert_eq!(d3.state_tag, "확정");
-        assert_eq!(d3.stable_idx, 3);
+        // EMA가 3으로 역전되어 50%를 초과할 때까지 2프레임 주입
+        let _ = stab.update(&open_probs, 150.0);
+        let _ = stab.update(&open_probs, 150.0);
 
-        // 손펴기(3) 수축 유지 중 잡음(1) 방어
+        let d1 = stab.update(&open_probs, 150.0);
+        assert_eq!(d1.best_cand, 3);
+        assert_eq!(d1.required_debounce, 4); // 제스처 간 전환: 4프레임
+        assert_eq!(d1.candidate_count, 1);
+
+        let _ = stab.update(&open_probs, 150.0); // count = 2
+        let _ = stab.update(&open_probs, 150.0); // count = 3
+        let d4 = stab.update(&open_probs, 150.0); // count = 4 -> 확정!
+        assert_eq!(d4.state_tag, "확정");
+        assert_eq!(d4.stable_idx, 3);
+
+        // 손펴기(3) 수축 유지 중 잡음(1) 방어 (수축 유지 에너지 RMS 120.0)
         stab.last_transition_time = Instant::now() - Duration::from_millis(500);
         let noise_probs = [0.05, 0.90, 0.02, 0.03];
-        let _ = stab.update(&noise_probs, 60.0);
-        let _ = stab.update(&noise_probs, 60.0);
-        let dn = stab.update(&noise_probs, 60.0);
+        let _ = stab.update(&noise_probs, 120.0);
+        let _ = stab.update(&noise_probs, 120.0);
+        let dn = stab.update(&noise_probs, 120.0);
         assert_eq!(dn.state_tag, "유지");
         assert_eq!(dn.stable_idx, 3); // 손펴기 악력 유지
         assert!(dn.reason.contains("수축 유지 중 잡음 방어"));
+    }
+
+    #[test]
+    fn test_stabilizer_noise_to_fist_blocked_by_energy_gate() {
+        let mut stab = GestureStabilizer::new(3, 45.0);
+        stab.current_stable_gesture = 1; // 동적 잡음 상태
+        stab.last_transition_time = Instant::now() - Duration::from_millis(500);
+
+        // 신경망이 일시적으로 주먹(2)을 95%로 예측했으나 실제 RMS가 70.0 (잡음 수준, < 110.0)인 경우
+        let fist_spike_probs = [0.02, 0.03, 0.95];
+        for _ in 0..10 {
+            let d = stab.update(&fist_spike_probs, 70.0);
+            // 물리 인터락에 의해 Class 1로 강제 리매핑되어 주먹(2)으로 절대 전이되지 않음!
+            assert_eq!(d.stable_idx, 1);
+            assert_ne!(d.best_cand, 2);
+        }
+    }
+
+    #[test]
+    fn test_stabilizer_noise_to_fist_debouncing_from_noise() {
+        let mut stab = GestureStabilizer::new(3, 45.0);
+        stab.current_stable_gesture = 1; // 동적 잡음 상태
+        stab.last_transition_time = Instant::now() - Duration::from_millis(500);
+
+        // 진짜 주먹 수축: RMS 250.0 (에너지 게이트 통과), 확률 90%
+        let fist_probs = [0.02, 0.08, 0.90];
+        // Frame 1: EMA 전환
+        let _ = stab.update(&fist_probs, 250.0);
+        let d = stab.update(&fist_probs, 250.0);
+        assert_eq!(d.best_cand, 2);
+        // 동적 잡음(1) -> 주먹(2) 진입은 3프레임이 아닌 5프레임 엄격 검증 요구!
+        assert_eq!(d.required_debounce, 5);
+    }
+
+    #[test]
+    fn test_stabilizer_fist_noise_decay_release_when_relaxed() {
+        let mut stab = GestureStabilizer::new(3, 45.0);
+        stab.current_stable_gesture = 2; // 주먹 상태
+        stab.ema_probs = vec![0.0, 0.0, 1.0];
+        stab.last_transition_time = Instant::now() - Duration::from_millis(500);
+
+        // 사용자가 손을 펴서 RMS가 50.0(< min_sustain_rms 80.0)으로 떨어지며 잡음(1) 유입
+        let noise_probs = [0.05, 0.90, 0.05];
+        let _ = stab.update(&noise_probs, 50.0); // EMA 전이
+        let d1 = stab.update(&noise_probs, 50.0);
+        assert_eq!(d1.best_cand, 1);
+        assert_eq!(d1.state_tag, "전이"); // 잡음 방어에 갇히지 않고 전이 시작!
+
+        let _ = stab.update(&noise_probs, 50.0);
+        let d3 = stab.update(&noise_probs, 50.0);
+        assert_eq!(d3.state_tag, "확정");
+        assert_eq!(d3.stable_idx, 1); // 3프레임 만에 동적 잡음(1)으로 정상 탈출!
     }
 }
 

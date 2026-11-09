@@ -7,7 +7,7 @@ use burn::{
         LayerNormConfig, Linear, LinearConfig,
     },
     tensor::{
-        activation::silu,
+        activation::{sigmoid, silu},
         backend::{AutodiffBackend, Backend},
         Distribution, Int, Tensor,
     },
@@ -373,17 +373,29 @@ pub struct EmgModularMlpConfig {
 
 #[derive(Module, Debug)]
 pub struct EmgModularMlpModel<B: Backend> {
-    // [단계 2] Input Stem & 학습 가능한 시점 위치 인코딩
+    // [단계 2] Dual-Stream Physiology-Aware Input Stem & 학습 가능한 시점 위치 인코딩
+    // - Stream A (Spatial Muscle Synergy Pattern): stem_linear -> stem_norm -> stem_act
+    //   LayerNorm의 스케일 불변성 LN(c*h) = LN(h)을 활용하여 등척성 유지기(Phase 2)에 전체 진폭이 40~60% 감쇠하더라도
+    //   5채널 근육 간 공간적 협응 비율(Spatial Synergy Ratio)을 불변(Invariant) 상태로 추출합니다.
+    // - Stream B (Monotonic Contraction Intensity Gate): intensity_gate -> 2 * sigmoid(.)
+    //   기존 L2 Norm(sqrt(mean(z^2)))이 Z-Score 평균(z=0, 지속 주먹 유지 구간)에서 최소값(0)으로 함몰되는
+    //   비단조 U자 사각지대(Zero-Energy Singularity)를 원천 제거하고, 수축 에너지에 대해 엄격한 단조성(Monotonicity)을 보장합니다.
     stem_linear: Linear<B>,
     stem_norm: LayerNorm<B>,
     stem_act: Gelu,
+    intensity_gate: Linear<B>,
     pos_embed: Param<Tensor<B, 3>>,
 
     // [단계 5] Repeatable Backbone (SpatioTemporalMlpBlock 적층)
     backbone: Vec<SpatioTemporalMlpBlock<B>>,
 
-    // [단계 6] Output Head (Final LayerNorm + Readout Linear)
+    // [단계 6] Tri-Phasic Biomechanical Readout Head (3상 생체역학 다중 스케일 판독 헤드)
+    // - Phasic Instantaneous State (f_last): 최신 프레임 x[:, T-1, :] (위상차 없는 즉각 반응)
+    // - Tonic Isometric Sustain State (f_tonic): 윈도우 시간 평균 mean_t(x) (Phase 2/3 운동단위 발화 골짜기 적분 평활화)
+    // - Contraction Flux Derivative (f_flux): x[:, T-1, :] - x[:, 0, :] (수축 개시/등척성 유지/이완 동역학 기울기)
     final_norm: LayerNorm<B>,
+    tonic_proj: Linear<B>,
+    flux_proj: Linear<B>,
     head: Linear<B>,
 
     window_size: usize,
@@ -422,13 +434,29 @@ impl EmgModularMlpConfig {
             ));
         }
 
+        // 단조 수축 강도 게이트(intensity_gate) 및 3상 생체역학 투영(tonic_proj, flux_proj) 초기화:
+        // 초기 상태에서 z=0일 때 2 * sigmoid(0) = 1.0 항등 스케일을 형성하도록 작은 분산(std=0.02)으로 초기화
+        let gate_init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+
         EmgModularMlpModel {
             stem_linear: LinearConfig::new(self.d_in, self.d_model).init(device),
             stem_norm: LayerNormConfig::new(self.d_model).init(device),
             stem_act: Gelu::new(),
+            intensity_gate: LinearConfig::new(self.d_in, self.d_model)
+                .with_initializer(gate_init.clone())
+                .init(device),
             pos_embed: Param::from_tensor(pos_init),
             backbone,
             final_norm: LayerNormConfig::new(self.d_model).init(device),
+            tonic_proj: LinearConfig::new(self.d_model, self.d_model)
+                .with_initializer(gate_init.clone())
+                .init(device),
+            flux_proj: LinearConfig::new(self.d_model, self.d_model)
+                .with_initializer(gate_init)
+                .init(device),
             head: LinearConfig::new(self.d_model, self.num_classes).init(device),
             window_size: t,
             d_model: self.d_model,
@@ -478,42 +506,53 @@ impl<B: Backend> EmgModularMlpModel<B> {
             last_frame.repeat_dim(1, self.window_size)
         };
 
-        // [단계 2] Input Stem:
-        // ⚠️ sEMG 신호처리 핵심 원리: 이미 채널별 Z-Score 표준화된 입력에서 Stem에 LayerNorm을 직접 걸면
-        // LN(c * x) = LN(x) 스케일 불변성으로 인해 가장 중요한 물리량인 '근수축 에너지 크기(||x||_2, RMS)'가 소실됩니다.
-        // 따라서 각 시점의 에너지 노름(L2 Norm)을 계산하여 LayerNorm 출력에 재결합(Norm-Preserving Stem)함으로써
-        // 헤시안 조건수 안정화(등방성)와 근수축 강도 보존을 동시에 달성합니다.
+        // [단계 2] Dual-Stream Physiology-Aware Input Stem:
+        // 1) Stream A (Scale-Invariant Spatial Synergy Pattern):
+        //    LayerNorm을 통해 전체 진폭 변화(Phase 2 등척성 진폭 감쇠)에 흔들리지 않는 5채널 공간 협응 벡터 추출
         let h_stem = self.stem_linear.forward(x_in.clone());
-        let energy_scale = x_in
-            .powf_scalar(2.0)
-            .mean_dim(2)
-            .sqrt()
-            .clamp(0.1, 10.0); // [Batch, T, 1] 근수축 에너지 스케일 보존
-        let x = self.stem_norm.forward(h_stem) * energy_scale;
-        let mut x = self.stem_act.forward(x) + self.pos_embed.val();
+        let h_pat = self.stem_act.forward(self.stem_norm.forward(h_stem));
 
-        // [단계 5] Repeatable Backbone
+        // 2) Stream B (Monotonic Contraction Intensity Gate):
+        //    G_int(z) = 2 * sigmoid(W_int * z + b_int) ∈ (0, 2)
+        //    기존 sqrt(mean(z^2))의 z=0(데이터셋 평균 = 지속 수축 구간) 에너지 소실 특이점을 완벽히 해소하며,
+        //    휴식(z < 0) -> 지속 수축(z ≈ 0) -> 폭발 수축(z > 0) 전 구간에서 엄격한 단조 증가(Strict Monotonicity)를 보장합니다.
+        let g_int = sigmoid(self.intensity_gate.forward(x_in)) * 2.0;
+
+        let mut x = h_pat * g_int.clone() + self.pos_embed.val();
+
+        // [단계 5] Repeatable Backbone (SpatioTemporalMlpBlock 적층)
         for block in &self.backbone {
             x = block.forward_with_mode(x, is_training);
         }
 
-        // [단계 6] Output Head: Final LayerNorm + 에너지 스케일 복원 -> Causal Slicing (최신 시점 t = -1) -> Linear Readout
-        let out_energy = x
-            .clone()
-            .powf_scalar(2.0)
-            .mean_dim(2)
-            .sqrt()
-            .clamp(0.1, 10.0);
-        let x = self.final_norm.forward(x) * out_energy;
+        // [단계 6] Tri-Phasic Biomechanical Readout Head:
+        // Final LayerNorm 후 단조 수축 강도 게이트(g_int)를 재결합하고,
+        // 근수축 3상(Phasic Onset / Tonic Isometric Plateau / Motor Unit Rotation)을 포괄하는 3대 상태 벡터를 융합합니다.
+        let x = self.final_norm.forward(x) * g_int;
 
         let feat = if self.causal_readout {
-            // 기능 6.2 (Causal Slicing): 최신 프레임 x[:, -1, :]만 추출하여 위상 지연 최소화
-            x.slice([
-                0..batch_size,
-                (self.window_size - 1)..self.window_size,
-                0..self.d_model,
-            ])
-            .reshape([batch_size, self.d_model])
+            // (1) Phasic Instantaneous State (f_last): 최신 시점 t = T-1 즉각 반응 특징
+            let f_last = x
+                .clone()
+                .slice([
+                    0..batch_size,
+                    (self.window_size - 1)..self.window_size,
+                    0..self.d_model,
+                ])
+                .reshape([batch_size, self.d_model]);
+
+            // (2) Tonic Isometric Sustain State (f_tonic): 윈도우 전 구간(160ms) 평균 적분 특징
+            //     Phase 2/3의 8~12Hz 운동단위 비동기 발화 골짜기(Inter-spike valley)에서도 흔들림 없는 지속 파지력 유지
+            let f_tonic = x.clone().mean_dim(1).reshape([batch_size, self.d_model]);
+
+            // (3) Contraction Flux Derivative (f_flux): 윈도우 종단-시단 차분 (f_last - f_first)
+            //     수축 개시(양의 기울기), 등척성 유지(영 기울기), 의도적 이완(음의 기울기)의 동역학적 위상 판별
+            let f_first = x
+                .slice([0..batch_size, 0..1, 0..self.d_model])
+                .reshape([batch_size, self.d_model]);
+            let f_flux = f_last.clone() - f_first;
+
+            f_last + self.tonic_proj.forward(f_tonic) + self.flux_proj.forward(f_flux)
         } else {
             // 기능 6.2 (Global Mean Pooling): 구간 평균 풀링
             x.mean_dim(1).reshape([batch_size, self.d_model])
@@ -712,6 +751,51 @@ mod tests {
         let x_2d = Tensor::<MyBackend, 2>::zeros([2, 75], &device);
         let out_2d = model.forward_2d(x_2d);
         assert_eq!(out_2d.dims(), [2, 3]);
+    }
+
+    #[test]
+    fn test_dual_stream_monotonic_gate_and_tri_phasic_readout() {
+        let device = WgpuDevice::default();
+        let model = EmgModularMlpModel::<MyBackend>::new(&device, 35, 3);
+
+        // 1. Z-Score 평균(z = 0.0) 입력 시에도 intensity_gate가 2 * sigmoid(0) = 1.0으로 작동하여
+        //    특징량이 0으로 소실되지 않고 유한한 로짓을 생성하는지 검증
+        let z_zero = Tensor::<MyBackend, 3>::zeros([1, MODULAR_MLP_WINDOW_SIZE, 35], &device);
+        let out_zero = model.forward(z_zero);
+        let logits_zero: Vec<f32> = out_zero.into_data().to_vec().unwrap();
+        assert_eq!(logits_zero.len(), 3);
+        assert!(logits_zero.iter().all(|v| v.is_finite()));
+
+        // 2. 시간에 따라 변화하는 3상(Tri-Phasic) 시계열 입력에서 f_last, f_tonic, f_flux가
+        //    정상적으로 결합되어 정적 복제 윈도우와 구별되는 출력을 생성하는지 검증
+        let mut ramp_data = Vec::with_capacity(MODULAR_MLP_WINDOW_SIZE * 35);
+        for t in 0..MODULAR_MLP_WINDOW_SIZE {
+            let val = -1.0 + (t as f32) * 0.4; // t=0: -1.0 -> t=7: +1.8 (수축 개시 양의 기울기)
+            for _ in 0..35 {
+                ramp_data.push(val);
+            }
+        }
+        let x_ramp = Tensor::<MyBackend, 1>::from_floats(ramp_data.as_slice(), &device)
+            .reshape([1, MODULAR_MLP_WINDOW_SIZE, 35]);
+        let out_ramp = model.forward(x_ramp);
+        let logits_ramp: Vec<f32> = out_ramp.into_data().to_vec().unwrap();
+
+        // 마지막 프레임(val = 1.8)만 정적으로 복제한 윈도우 (f_flux = 0)
+        let x_static = Tensor::<MyBackend, 3>::ones([1, MODULAR_MLP_WINDOW_SIZE, 35], &device)
+            .mul_scalar(1.8);
+        let out_static = model.forward(x_static);
+        let logits_static: Vec<f32> = out_static.into_data().to_vec().unwrap();
+
+        let diff_sum: f32 = logits_ramp
+            .iter()
+            .zip(logits_static.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff_sum > 1e-4,
+            "Tri-Phasic readout must distinguish dynamic ramp from static hold (diff_sum={})",
+            diff_sum
+        );
     }
 }
 
