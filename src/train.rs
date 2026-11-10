@@ -18,7 +18,8 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 
 pub type MyBackend = Wgpu<f32, i32>;
 pub type MyAutodiffBackend = burn::backend::Autodiff<MyBackend>;
@@ -975,6 +976,105 @@ where
     Ok(saved_file)
 }
 
+/// 🚀 [자동 라벨 정제 (Auto-Onset Trimming)]
+/// 사용자가 녹화 시 시작 신호보다 1~2초 늦게 수축하거나(반응 지연), 종료 신호 전에 조기 이완한 경우
+/// Class >= 2(능동 수축) 블록의 앞뒤에서 실효 AC-RMS가 휴식 기준선 미만인 오염 프레임을 자동 검출하여 제거합니다.
+pub fn auto_trim_reaction_delay(
+    items: Vec<EmgItem>,
+    num_features: usize,
+) -> (Vec<EmgItem>, usize) {
+    if items.is_empty() {
+        return (items, 0);
+    }
+
+    let get_rms = |feats: &[f32]| -> f32 {
+        if num_features >= 75 {
+            (0..5).map(|ch| feats.get(45 + ch * 6).copied().unwrap_or(0.0)).sum()
+        } else if num_features == 35 {
+            (0..5).map(|ch| feats.get(5 + ch * 6).copied().unwrap_or(0.0)).sum()
+        } else {
+            feats.iter().take(5).copied().map(|v| v.abs()).sum()
+        }
+    };
+
+    // 1. Class 0 (정적 휴식) 평균 RMS 계산
+    let rest_samples: Vec<f32> = items
+        .iter()
+        .filter(|it| it.label == 0)
+        .map(|it| get_rms(&it.features))
+        .collect();
+
+    let mean_rest_rms = if !rest_samples.is_empty() {
+        rest_samples.iter().sum::<f32>() / (rest_samples.len() as f32)
+    } else {
+        22.0
+    };
+
+    // 수축 판정 임계치 (휴식의 1.75배 또는 최소 55.0 RMS)
+    let onset_threshold = (mean_rest_rms * 1.75).max(55.0);
+
+    // 2. 연속 라벨 블록 분할
+    let mut contiguous_blocks: Vec<(usize, Vec<EmgItem>)> = Vec::new();
+    for it in items {
+        if let Some((lbl, ref mut block)) = contiguous_blocks.last_mut() {
+            if *lbl == it.label {
+                block.push(it);
+                continue;
+            }
+        }
+        contiguous_blocks.push((it.label, vec![it]));
+    }
+
+    let mut total_trimmed = 0usize;
+    let mut cleaned_items = Vec::new();
+
+    for (label, block) in contiguous_blocks {
+        if label < 2 || block.len() < 10 {
+            // Class 0(휴식) 및 Class 1(동적 잡음)은 트리밍하지 않고 원형 보존
+            cleaned_items.extend(block);
+            continue;
+        }
+
+        let n = block.len();
+        // 앞쪽 반응 지연 검사 (최대 40% 한도)
+        let max_front_trim = (n * 40) / 100;
+        let mut front_trim = 0usize;
+        for i in 0..max_front_trim {
+            if get_rms(&block[i].features) < onset_threshold {
+                front_trim += 1;
+            } else {
+                break;
+            }
+        }
+
+        // 뒤쪽 조기 이완 검사 (최대 25% 한도)
+        let max_back_trim = (n * 25) / 100;
+        let mut back_trim = 0usize;
+        for i in 0..max_back_trim {
+            let idx = n - 1 - i;
+            if idx <= front_trim {
+                break;
+            }
+            if get_rms(&block[idx].features) < onset_threshold {
+                back_trim += 1;
+            } else {
+                break;
+            }
+        }
+
+        let end_idx = n.saturating_sub(back_trim);
+        if front_trim < end_idx {
+            total_trimmed += front_trim + back_trim;
+            cleaned_items.extend(block[front_trim..end_idx].iter().cloned());
+        } else {
+            // 과도하게 잘려나가는 경우 안전하게 원본 유지
+            cleaned_items.extend(block);
+        }
+    }
+
+    (cleaned_items, total_trimmed)
+}
+
 /// =========================================================================
 /// 🚀 [단계 1: 시계열 슬라이딩 윈도우 & 세션 블록 격리 분할 데이터셋 로더]
 /// =========================================================================
@@ -1090,7 +1190,16 @@ pub fn load_modular_mlp_dataset(
         num_features = TOTAL_FEATURES_ALL;
     }
 
-    // 1. 기능 1.4: 왜곡 없는 실제 센서 분포를 반영하기 위해 원본 데이터(raw_items)에서 먼저 채널별 평균 μ 및 표준편차 σ 산출
+    // 1. 기능 1.4: 왜곡 없는 실제 센서 분포를 반영하기 위해 반응 지연 구간(Reaction Delay)을 먼저 자동 정제한 뒤 채널별 평균 μ 및 표준편차 σ 산출
+    let (raw_items, trimmed_frames) = auto_trim_reaction_delay(raw_items, num_features);
+    if trimmed_frames > 0 {
+        println!(
+            "✨ [자동 라벨 정제 (Auto-Onset Trimming)] 수축 시작 지연/조기 이완 오염 프레임 {}개 자동 제거 완료 (유효 샘플: {}개)",
+            trimmed_frames,
+            raw_items.len()
+        );
+    }
+
     let mut means = vec![0.0f32; num_features];
     let mut stds = vec![0.0f32; num_features];
     let total_raw = (raw_items.len().max(1)) as f32;
@@ -1843,4 +1952,237 @@ where
         ModelArchitecture::Cnn => train_cnn_model(device, config, progress_callback),
         ModelArchitecture::Lstm => train_lstm_model(device, config, progress_callback),
     }
+}
+
+/// =========================================================================
+/// 🚀 [멀티 세션/피험자 데이터셋 병합 유틸리티]
+/// =========================================================================
+/// 여러 개의 35D 또는 75D CSV 데이터셋을 하나의 통합 CSV 파일로 안전하게 병합합니다.
+pub fn merge_csv_datasets(
+    source_paths: &[&str],
+    output_path: &str,
+) -> io::Result<usize> {
+    if source_paths.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "병합할 소스 파일이 없습니다."));
+    }
+
+    let out_file = File::create(output_path)?;
+    let mut writer = io::BufWriter::new(out_file);
+    let mut header_written = false;
+    let mut total_rows = 0usize;
+
+    for &path in source_paths {
+        if !Path::new(path).exists() {
+            eprintln!("⚠️ [경고] 병합 소스 파일이 존재하지 않아 건너뜁니다: {}", path);
+            continue;
+        }
+        let in_file = File::open(path)?;
+        let reader = io::BufReader::new(in_file);
+        let mut lines = reader.lines();
+
+        if let Some(Ok(header)) = lines.next() {
+            if !header_written {
+                writeln!(writer, "{}", header)?;
+                header_written = true;
+            }
+        }
+
+        for line_res in lines {
+            let line = line_res?;
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                writeln!(writer, "{}", trimmed)?;
+                total_rows += 1;
+            }
+        }
+    }
+    writer.flush()?;
+    Ok(total_rows)
+}
+
+/// =========================================================================
+/// 🚀 [시연용 초고속 SFT 파인튜닝 파이프라인 (Fine-Tuning Engine)]
+/// =========================================================================
+/// - 신규 사용자의 1세트 데이터(휴식 6초 -> 팔 흔들기 6초 -> 주먹 유지 9초)로부터 개인별 정규화 통계(μ, σ)를 캘리브레이션
+/// - 베이스 모델(멀티 피험자 사전학습 모델)의 시공간 특징 지식을 유지하면서 개인화 Stem 및 Head를 빠르게 적응
+/// - 파괴적 망각 방지를 위해 베이스 데이터셋의 하드 노이즈 샘플(30%)을 경험 리플레이(Replay)로 혼합
+pub fn finetune_modular_mlp_model<F>(
+    device: &WgpuDevice,
+    base_model_path: &str,
+    target_dataset_path: &str,
+    replay_dataset_path: Option<&str>,
+    epochs: usize,
+    learning_rate: f64,
+    mut progress_callback: F,
+) -> io::Result<String>
+where
+    F: FnMut(TrainingProgress),
+{
+    let window_size = MODULAR_MLP_WINDOW_SIZE;
+    println!(
+        "\n⚡ [현장 시연용 고속 SFT 파인튜닝] 대상: {} | 베이스 모델: {}",
+        target_dataset_path, base_model_path
+    );
+
+    // 1. 신규 사용자의 1세트 데이터셋 로드 (신규 사용자 체형/전극 맞춤 정규화 통계 산출 & 반응 지연 자동 정제)
+    let (mut target_train, target_valid, target_stats) =
+        load_modular_mlp_dataset(target_dataset_path, window_size)?;
+    let feature_dim = target_stats.feature_dim;
+
+    println!(
+        "✔ [1세트 개인화 데이터 로드] 학습 윈도우: {}개 | 검증 윈도우: {}개",
+        target_train.len(),
+        target_valid.len()
+    );
+
+    // 2. 경험 리플레이(Experience Replay) 결합: 베이스 데이터셋에서 하드 노이즈/대표 샘플 추출하여 망각 방지
+    if let Some(rep_path) = replay_dataset_path {
+        if Path::new(rep_path).exists() {
+            println!("🔄 [망각 방지 Replay 결합] 베이스 데이터셋({})에서 하드 노이즈 샘플 로드 중...", rep_path);
+            if let Ok((rep_train, _, _)) = load_modular_mlp_dataset(rep_path, window_size) {
+                // Class 1 (동적 잡음) 우선 추출 + 일부 Class 0/2 혼합
+                let mut replay_candidates: Vec<EmgSeqItem> = rep_train
+                    .items
+                    .into_iter()
+                    .filter(|it| it.label == 1 || it.label == 2)
+                    .collect();
+
+                let mut rng = thread_rng();
+                replay_candidates.shuffle(&mut rng);
+
+                // 신규 사용자 데이터의 약 30% 비율로 리플레이 샘플 추가
+                let max_replay = (target_train.len() * 3) / 7;
+                let take_count = replay_candidates.len().min(max_replay);
+                println!(
+                    "  -> 신규 사용자 샘플: {}개 (70%) + 베이스 리플레이 샘플: {}개 (30%) 혼합",
+                    target_train.len(),
+                    take_count
+                );
+                target_train.items.extend(replay_candidates.into_iter().take(take_count));
+                target_train.items.shuffle(&mut rng);
+            }
+        }
+    }
+
+    let batcher_train = EmgSeqBatcher::<MyAutodiffBackend>::new(device.clone());
+    let batcher_valid = EmgSeqBatcher::<MyBackend>::new(device.clone());
+
+    let total_train = target_train.len();
+    let batch_size = 32.min(total_train.max(1));
+    let dataloader_train = DataLoaderBuilder::new(batcher_train)
+        .batch_size(batch_size)
+        .shuffle(42)
+        .num_workers(1)
+        .build(target_train);
+
+    let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
+        .batch_size(batch_size)
+        .num_workers(1)
+        .build(target_valid);
+
+    // 3. 베이스 모델 아키텍처 초기화 및 가중치 로드
+    let mod_mlp_cfg = EmgModularMlpConfig {
+        d_in: feature_dim,
+        window_size,
+        d_model: 64,
+        num_classes: target_stats.num_classes,
+        num_blocks: 2,
+        dropout: 0.15,
+        max_drop_path: 0.05,
+        layer_scale_init: 1e-1,
+        causal_readout: true,
+    };
+
+    let mut model = mod_mlp_cfg.init::<MyAutodiffBackend>(device);
+    let recorder = CompactRecorder::new();
+
+    let load_source = if Path::new(base_model_path).exists() {
+        base_model_path
+    } else if Path::new("emg_modular_mlp_base_model.mpk").exists() {
+        "emg_modular_mlp_base_model.mpk"
+    } else {
+        "emg_modular_mlp_model.mpk"
+    };
+
+    let base_name = load_source.trim_end_matches(".mpk");
+    match recorder.load(base_name.into(), device) {
+        Ok(rec) => {
+            model = model.load_record(rec);
+            println!("✔ [베이스 모델 가중치 전이 성공] '{}' 가중치를 기반으로 파인튜닝을 시작합니다.", load_source);
+        }
+        Err(e) => {
+            println!("⚠️ [알림] 베이스 가중치 로드 실패({:?}) -> 스크래치 초기화로 진행합니다.", e);
+        }
+    }
+
+    let artifacts_dir = "./model_artifacts/sft";
+    if !std::path::Path::new(artifacts_dir).exists() {
+        let _ = std::fs::create_dir_all(artifacts_dir);
+    }
+
+    // 4. 고속 수렴 스케줄러 구성 (10~15 Epochs, Cosine Annealing)
+    let steps_per_epoch = (total_train + batch_size - 1) / batch_size;
+    let total_steps = (epochs * steps_per_epoch).max(10);
+    let warmup_steps = ((total_steps as f64) * 0.10).round() as usize;
+    let lr_scheduler = WarmupCosineLrScheduler::new(
+        learning_rate,
+        1e-6,
+        warmup_steps.max(1),
+        total_steps,
+    );
+    let optim = AdamWConfig::new()
+        .with_weight_decay(1e-3)
+        .init();
+
+    println!(
+        "[*] 초고속 SFT 진행 중 ({} Epochs, AdamW lr: {:?} -> 1e-6, 클래스: {}개 - {})...",
+        epochs,
+        learning_rate,
+        target_stats.num_classes,
+        target_stats.class_names.join(", ")
+    );
+
+    let learner = LearnerBuilder::new(artifacts_dir)
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .metric_train_numeric(AccuracyMetric::new())
+        .metric_valid_numeric(AccuracyMetric::new())
+        .with_file_checkpointer(CompactRecorder::new())
+        .devices(vec![device.clone()])
+        .num_epochs(epochs)
+        .build(model, optim, lr_scheduler);
+
+    let trained_model = learner.fit(dataloader_train, dataloader_valid);
+
+    // 5. 파인튜닝된 전용 모델 및 활성 모델 동시 저장
+    let sft_model_name = "emg_modular_mlp_sft_model";
+    recorder
+        .record(trained_model.into_record(), sft_model_name.into())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SFT 가중치 저장 실패: {:?}", e)))?;
+
+    // 실시간 추론에서 바로 읽을 수 있도록 emg_modular_mlp_model.mpk 에도 복사 저장
+    let sft_mpk_path = format!("{}.mpk", sft_model_name);
+    let active_mpk_path = "emg_modular_mlp_model.mpk";
+    let _ = std::fs::copy(&sft_mpk_path, active_mpk_path);
+
+    println!("[+] SFT 모델 가중치 저장 완료 -> {}", sft_mpk_path);
+    println!("[+] 활성 실시간 모델 즉시 갱신 완료 -> {}", active_mpk_path);
+
+    // 정규화 통계 저장 (SFT 전용 및 기본 norm_stats.json 갱신)
+    if let Err(e) = target_stats.save(sft_model_name) {
+        eprintln!("⚠️ SFT 정규화 통계 저장 실패: {:?}", e);
+    } else {
+        println!("✔ [개인화 정규화 통계 갱신] norm_stats_{}.json 및 norm_stats.json 저장 완료", sft_model_name);
+    }
+
+    progress_callback(TrainingProgress {
+        epoch: epochs,
+        total_epochs: epochs,
+        loss: 0.0,
+        status: "completed".to_string(),
+        model_type: "Block-MLP SFT".to_string(),
+        model_file: Some(active_mpk_path.to_string()),
+    });
+
+    Ok(active_mpk_path.to_string())
 }

@@ -50,8 +50,10 @@ fn main() {
         println!(" 7. 🔬 3초 정제 4D LDA & SVM 분류기 분석 및 학습 (Pure Rust)");
         println!(" 8. 🩺 센서 신호 실시간 진단 & 접촉 테스트 (Live Health Check)");
         println!(" 9. 📊 데이터셋 종합 품질 분석기 (Quality Assessor)");
-        println!(" 10. 🚪 프로그램 종료");
-        print!("메뉴를 선택하세요 (1-10) > ");
+        println!(" 10. 🏛️ 메인(베이스) 모델 학습 및 영구 백업 (11/08 + 11/10 멀티 피험자 통합)");
+        println!(" 11. ⚡ 현장 시연용 1세트 초고속 SFT 파인튜닝 & 즉시 실시간 시연");
+        println!(" 12. 🚪 프로그램 종료");
+        print!("메뉴를 선택하세요 (1-12) > ");
         io::stdout().flush().unwrap();
 
         let mut input = String::new();
@@ -100,11 +102,21 @@ fn main() {
                 }
             }
             "10" => {
+                if let Err(e) = run_base_model_training_and_backup(&device) {
+                    eprintln!("❌ 베이스 모델 학습/백업 에러: {}", e);
+                }
+            }
+            "11" => {
+                if let Err(e) = run_sft_demonstration_pipeline(&device) {
+                    eprintln!("❌ SFT 파인튜닝/시연 에러: {}", e);
+                }
+            }
+            "12" => {
                 println!("프로그램을 종료합니다.");
                 break;
             }
             _ => {
-                println!("❌ 올바른 번호를 입력하세요 (1~10)");
+                println!("❌ 올바른 번호를 입력하세요 (1~12)");
             }
         }
 
@@ -814,6 +826,357 @@ fn run_local_training(device: &WgpuDevice) -> io::Result<()> {
     Ok(())
 }
 
+fn select_dataset_file(prompt: &str) -> io::Result<String> {
+    let mut found_files = Vec::new();
+    for entry in glob("emg_dataset_*.csv").expect("Failed glob") {
+        if let Ok(path) = entry {
+            if std::fs::metadata(&path).map(|m| m.len() > 600).unwrap_or(false) {
+                found_files.push(path);
+            }
+        }
+    }
+    for entry in glob("uploads/*.csv").expect("Failed glob") {
+        if let Ok(path) = entry {
+            if std::fs::metadata(&path).map(|m| m.len() > 600).unwrap_or(false) {
+                found_files.push(path);
+            }
+        }
+    }
+
+    found_files.sort();
+    if found_files.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "사용 가능한 데이터셋 파일이 없습니다."));
+    }
+
+    println!("\n[데이터셋 목록]");
+    for (i, file) in found_files.iter().enumerate() {
+        let file_str = file.display().to_string();
+        let tag = if file_str.contains("base_merged_35d") {
+            "  <-- 🌟 [🥇 메인 베이스 통합 35D 데이터셋 (11/08 + 11/10 24세트)]"
+        } else if file_str.contains("20261110_182520_35d") {
+            "  <-- 🌟 [피험자 B: 11/10 35D (초고강도 쉐이킹 잡음 & 강수축)]"
+        } else if file_str.contains("20261108_172654_35d") {
+            "  <-- 🌟 [피험자 A: 11/08 35D (규격 Onset & 3상성 피로)]"
+        } else if file_str.contains("35d") {
+            "  <-- [35D 경량 시간도메인 전용]"
+        } else {
+            ""
+        };
+        println!("  [{}] {}{}", i + 1, file.display(), tag);
+    }
+    print!("{} (기본 1번) > ", prompt);
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let choice = input.trim().parse::<usize>().unwrap_or(1);
+    let selected = if choice > 0 && choice <= found_files.len() {
+        found_files[choice - 1].display().to_string()
+    } else {
+        found_files[0].display().to_string()
+    };
+    Ok(selected)
+}
+
+/// 🚀 [1세트 현장 초단기 캘리브레이션 녹화 (총 21초)]
+fn record_single_sft_set() -> io::Result<String> {
+    println!("\n========================================================");
+    println!(" 🎤 [현장 시연용 1세트 초단기 캘리브레이션 녹화 (총 21초)]");
+    println!("========================================================");
+    println!(" [순서 안내]");
+    println!("   1. 정적 휴식 (Rest)            : 6초 (팔에 힘을 완전히 빼고 편안히 유지)");
+    println!("   2. 동적 잡음 (Noise/Arm Motion): 6초 (일상적인 팔 흔들기, 손목 돌리기)");
+    println!("   3. 주먹 지속 유지 (Sustained Fist): 9초 (카운트다운 후 주먹을 꽉 쥐고 끝까지 유지!)");
+    println!("--------------------------------------------------------");
+
+    let port_name = "/dev/ttyACM0";
+    let baud_rate = 9600;
+
+    println!("시리얼 포트 연결 중: {}...", port_name);
+    let port = serialport::new(port_name, baud_rate)
+        .timeout(Duration::from_millis(1000))
+        .open()
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
+
+    let mut reader = BufReader::new(port);
+
+    // 센서 접촉 진단
+    println!("🩺 센서 접촉 상태 점검 중...");
+    let proceed = run_sensor_diagnostic_on_stream(&mut reader)?;
+    if !proceed {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "센서 진단 중 취소되었습니다."));
+    }
+
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let file_name = format!("emg_dataset_sft_demo_{}.csv", timestamp);
+    let mut csv_file = File::create(&file_name)?;
+    writeln!(csv_file, "{}", EmgFftProcessor::csv_header())?;
+
+    let steps = [
+        ActionStep { name: "정적 휴식 (Rest)", label_id: 0, duration_secs: 6 },
+        ActionStep { name: "동적 잡음 (Noise / Arm Motion)", label_id: 1, duration_secs: 6 },
+        ActionStep { name: "진짜 주먹 및 지속 유지 (Sustained Fist)", label_id: 2, duration_secs: 9 },
+    ];
+
+    println!("\n준비되셨으면 엔터 키를 누르세요...");
+    let mut dummy = String::new();
+    io::stdin().read_line(&mut dummy)?;
+
+    let mut processor = EmgFftProcessor::new();
+
+    for (idx, step) in steps.iter().enumerate() {
+        println!("\n--------------------------------------------------");
+        println!(" [ 단계 {} / 3 ] 👉 준비 동작: ** {} ** ({}초)", idx + 1, step.name, step.duration_secs);
+        println!("--------------------------------------------------");
+
+        for i in (1..=3).rev() {
+            print!("{}... ", i);
+            io::stdout().flush()?;
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        println!("시작! 🚀");
+
+        let start_time = Instant::now();
+        let transition_buffer = Duration::from_millis(1000); // 1초 과도기
+        let total_duration = Duration::from_secs(step.duration_secs);
+
+        while start_time.elapsed() < total_duration {
+            let mut line = String::new();
+            if let Ok(_) = reader.read_line(&mut line) {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let parts: Vec<f32> = trimmed
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<f32>().ok())
+                    .collect();
+
+                if parts.len() == NUM_CHANNELS {
+                    let mut raw_arr = [0.0f32; NUM_CHANNELS];
+                    raw_arr.copy_from_slice(&parts[..NUM_CHANNELS]);
+
+                    if start_time.elapsed() < transition_buffer {
+                        processor.update_buffer(&raw_arr);
+                        continue;
+                    }
+
+                    let all_features = processor.process_sample_all(&raw_arr);
+                    let mut row_str = String::new();
+                    for (i, val) in all_features.iter().enumerate() {
+                        if i > 0 {
+                            row_str.push(',');
+                        }
+                        row_str.push_str(&format!("{:.2}", val));
+                    }
+                    row_str.push_str(&format!(",{},{}\n", step.label_id, step.name));
+                    csv_file.write_all(row_str.as_bytes())?;
+
+                    let total_rms = EmgFftProcessor::extract_total_ac_rms(&all_features);
+                    let elapsed_sec = start_time.elapsed().as_secs_f32();
+                    print!("\r  ⏱️ [{:4.1}s / {:2}s] {} | Total RMS: {:5.1}   ", elapsed_sec, step.duration_secs, step.name, total_rms);
+                    io::stdout().flush()?;
+                }
+            }
+        }
+        println!();
+    }
+
+    csv_file.flush()?;
+
+    // 35D 버전 자동 추출
+    let file_35d_name = file_name.replace(".csv", "_35d.csv");
+    if let (Ok(in_f), Ok(out_f)) = (File::open(&file_name), File::create(&file_35d_name)) {
+        use std::io::BufWriter;
+        let mut rdr = BufReader::new(in_f);
+        let mut wrt = BufWriter::new(out_f);
+        let mut line_buf = String::new();
+        if rdr.read_line(&mut line_buf).is_ok() {
+            let cols: Vec<String> = line_buf.trim().split(',').map(|s| s.to_string()).collect();
+            let mut keep_indices = Vec::new();
+            for (idx, col) in cols.iter().enumerate() {
+                if !col.contains("_f") {
+                    keep_indices.push(idx);
+                }
+            }
+            let h_35: Vec<String> = keep_indices.iter().map(|&i| cols[i].clone()).collect();
+            let _ = writeln!(wrt, "{}", h_35.join(","));
+            let num_cols = cols.len();
+            line_buf.clear();
+
+            while rdr.read_line(&mut line_buf).is_ok() && !line_buf.is_empty() {
+                let parts: Vec<&str> = line_buf.trim().split(',').collect();
+                if parts.len() == num_cols {
+                    let row_35: Vec<&str> = keep_indices.iter().map(|&i| parts[i]).collect();
+                    let _ = writeln!(wrt, "{}", row_35.join(","));
+                }
+                line_buf.clear();
+            }
+        }
+    }
+
+    println!("\n✔ 1세트 데이터 수집 및 35D 변환 완료: {}", file_35d_name);
+    Ok(file_35d_name)
+}
+
+/// 🏛️ [기능 10: 메인(베이스) 모델 학습 및 영구 백업 관리자]
+fn run_base_model_training_and_backup(device: &WgpuDevice) -> io::Result<()> {
+    println!("\n========================================================");
+    println!(" 🏛️ [메인(베이스) 모델 학습 및 영구 백업 관리자]");
+    println!("========================================================");
+    println!(" 💡 여러 피험자/세션의 데이터를 병합하여 인류 공통 생체역학 지식을 갖춘");
+    println!("    범용 베이스 모델(Universal Base Model)을 학습하고 안전하게 백업합니다.");
+    println!("--------------------------------------------------------");
+
+    let f1 = "emg_dataset_noise_robust_20261108_172654_35d.csv";
+    let f2 = "emg_dataset_noise_robust_20261110_182520_35d.csv";
+    let both_exist = Path::new(f1).exists() && Path::new(f2).exists();
+
+    let dataset_to_train: String = if both_exist {
+        println!(" [1] 🌟 [강력 추천] 피험자 A(11/08) + 피험자 B(11/10) 데이터 자동 병합 후 베이스 학습 (총 24세트, 24,424샘플)");
+        println!(" [2] 특정 단일 데이터셋 선택하여 베이스 학습");
+        print!("선택 (1-2, 기본 1) > ");
+        io::stdout().flush()?;
+        let mut inp = String::new();
+        io::stdin().read_line(&mut inp)?;
+        if inp.trim() == "2" {
+            select_dataset_file("베이스 학습에 사용할 데이터셋 번호")?
+        } else {
+            let merged_path = "emg_dataset_base_merged_35d.csv";
+            println!("\n🔄 두 데이터셋 병합 중: {} + {} ➔ {}", f1, f2, merged_path);
+            let total_rows = emg_ml_pipeline::train::merge_csv_datasets(&[f1, f2], merged_path)?;
+            println!("✔ 병합 완료! 총 {}개 시계열 프레임 생성됨: {}", total_rows, merged_path);
+            merged_path.to_string()
+        }
+    } else {
+        select_dataset_file("베이스 학습에 사용할 데이터셋 번호")?
+    };
+
+    println!("\n🚀 Block-MLP (Temporal-SwiGLU) 베이스 모델 20 Epochs 학습 시작...");
+    let config = TrainingConfig {
+        dataset_path: dataset_to_train.clone(),
+        model_arch: ModelArchitecture::ModularMlp,
+        epochs: 20,
+        learning_rate: 1e-3,
+        batch_size: 64,
+        num_classes: 3,
+    };
+
+    let start_time = Instant::now();
+    let saved_file = train_model(device, &config, |prog: TrainingProgress| {
+        if prog.epoch % 5 == 0 || prog.epoch == 1 {
+            println!("  ➔ [Epoch {:2}/{:2}] Loss: {:.4}", prog.epoch, prog.total_epochs, prog.loss);
+        }
+    })?;
+
+    // 백업 생성
+    let backup_dir = "model_backups";
+    let _ = std::fs::create_dir_all(backup_dir);
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+
+    let base_model_name = "emg_modular_mlp_base_model";
+    let base_mpk = format!("{}.mpk", base_model_name);
+    let base_norm = format!("norm_stats_{}.json", base_model_name);
+
+    let _ = std::fs::copy(&saved_file, &base_mpk);
+    let _ = std::fs::copy("norm_stats.json", &base_norm);
+
+    let ts_mpk = format!("{}/base_model_{}.mpk", backup_dir, timestamp);
+    let ts_norm = format!("{}/base_model_{}_norm.json", backup_dir, timestamp);
+    let _ = std::fs::copy(&saved_file, &ts_mpk);
+    let _ = std::fs::copy("norm_stats.json", &ts_norm);
+
+    println!("\n========================================================");
+    println!(" 🎉 [메인(베이스) 모델 학습 및 영구 백업 완료]");
+    println!("========================================================");
+    println!(" 💾 활성 모델 가중치: {} (소요 시간: {:.1}초)", saved_file, start_time.elapsed().as_secs_f32());
+    println!(" 🏛️ 영구 보존 베이스 모델: {}", base_mpk);
+    println!(" 📦 타임스탬프 스냅샷 백업: {}", ts_mpk);
+    println!(" 💡 [안내] 앞으로 현장 시연에서 1세트 SFT를 진행하더라도,");
+    println!("    이 원본 베이스 모델은 손상되지 않고 언제든 복원/재활용 가능합니다!");
+    println!("========================================================\n");
+
+    Ok(())
+}
+
+/// ⚡ [기능 11: 현장 시연용 1세트 초고속 개인화 파인튜닝 (SFT) & 즉시 실시간 시연]
+fn run_sft_demonstration_pipeline(device: &WgpuDevice) -> io::Result<()> {
+    println!("\n========================================================");
+    println!(" ⚡ [현장 시연용 1세트 초고속 개인화 파인튜닝 (SFT) & 시연]");
+    println!("========================================================");
+    println!(" 💡 신규 참가자가 센서를 착용하고 단 1세트(~20초)만 녹화하면,");
+    println!("    참가자의 전완근 전극 배치/수축 특성에 맞춰 2~3초 만에 SFT 적응 후");
+    println!("    즉시 실시간 서보 모터 제어 시연으로 진입합니다.");
+    println!("--------------------------------------------------------");
+
+    let base_model_candidate = if Path::new("emg_modular_mlp_base_model.mpk").exists() {
+        "emg_modular_mlp_base_model.mpk"
+    } else if Path::new("emg_modular_mlp_model.mpk").exists() {
+        "emg_modular_mlp_model.mpk"
+    } else {
+        println!("⚠️ [주의] 베이스 모델이 발견되지 않았습니다. 먼저 메뉴 [10]에서 베이스 모델을 학습하는 것을 권장합니다.");
+        "emg_modular_mlp_model.mpk"
+    };
+
+    println!(" 🏛️ 사용될 베이스 모델: {}", base_model_candidate);
+    println!("\n[1세트 수집 방식 선택]");
+    println!("  [1] 🎤 지금 센서 착용하고 1세트 신규 녹화 (휴식 6초 ➔ 흔들기 6초 ➔ 주먹 9초, 총 ~21초)");
+    println!("  [2] 📂 기존 녹화된 데이터셋 파일 중 1세트 선택");
+    print!("선택 (1-2, 기본 1) > ");
+    io::stdout().flush()?;
+
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+
+    let target_dataset = if choice.trim() == "2" {
+        select_dataset_file("SFT에 사용할 1세트 데이터셋 번호")?
+    } else {
+        record_single_sft_set()?
+    };
+
+    let replay_dataset = if Path::new("emg_dataset_base_merged_35d.csv").exists() {
+        Some("emg_dataset_base_merged_35d.csv")
+    } else if Path::new("emg_dataset_noise_robust_20261110_182520_35d.csv").exists() {
+        Some("emg_dataset_noise_robust_20261110_182520_35d.csv")
+    } else if Path::new("emg_dataset_noise_robust_20261108_172654_35d.csv").exists() {
+        Some("emg_dataset_noise_robust_20261108_172654_35d.csv")
+    } else {
+        None
+    };
+
+    let start_time = Instant::now();
+    let sft_model_path = emg_ml_pipeline::train::finetune_modular_mlp_model(
+        device,
+        base_model_candidate,
+        &target_dataset,
+        replay_dataset,
+        12,
+        3e-4,
+        |prog: TrainingProgress| {
+            if prog.epoch % 3 == 0 || prog.epoch == 1 {
+                println!("  ⚡ [SFT Epoch {:2}/{:2}] Loss: {:.4}", prog.epoch, prog.total_epochs, prog.loss);
+            }
+        },
+    )?;
+
+    println!("\n========================================================");
+    println!(" 🎉 [초고속 SFT 개인화 완료] 소요 시간: {:.2}초", start_time.elapsed().as_secs_f32());
+    println!(" ✔ 모델 가중치 갱신: {}", sft_model_path);
+    println!(" ✔ 개인화 정규화 통계(Z-Score) 갱신 완료");
+    println!("========================================================");
+    print!("\n🚀 [시연 시작] 지금 즉시 실시간 서보 모터 제어 추론을 시작하시겠습니까? (Y/n) > ");
+    io::stdout().flush()?;
+
+    let mut run_ans = String::new();
+    io::stdin().read_line(&mut run_ans)?;
+    if run_ans.trim().is_empty() || run_ans.trim().eq_ignore_ascii_case("y") {
+        run_inference_pipeline_with_arch(device, Some(ModelArchitecture::ModularMlp));
+    }
+
+    Ok(())
+}
+
 /// 🚀 실시간 추론 시 제스처 안정화 엔진의 세부 판단 결과
 #[derive(Clone, Debug)]
 pub struct StabilizerDecision {
@@ -1076,34 +1439,43 @@ impl GestureStabilizer {
 // 3. 실시간 추론 (모델 선택 및 실시간 복합 추론)
 // =========================================================================
 fn run_inference_pipeline(device: &WgpuDevice) {
-    println!("\n[추론에 사용할 모델 선택]");
-    println!("  [1] MLP (emg_mlp_model.mpk) [1프레임 초고속 즉시추론]");
-    println!("  [2] 🚀 Block-MLP (emg_modular_mlp_model.mpk) [🥇 업그레이드 추천! O(1) 링버퍼(T=8) + Temporal-SwiGLU 블록 신경망]");
-    println!("  [3] 1D-TCN (emg_tcn_model.mpk)");
-    println!("  [4] 1D-CNN (emg_cnn_model.mpk)");
-    println!("  [5] LSTM (emg_lstm_model.mpk)");
-    println!("  [6] CNN + LSTM (emg_cnnlstm_model.mpk)");
-    println!("  [7] 4D LDA + SVM (emg_svm_model.json) [⚡ 4차원 판별 & 각 손가락 % 실시간 출력]");
-    print!("선택 (1-7, 기본 2: 업그레이드 Block-MLP) > ");
-    io::stdout().flush().unwrap();
+    run_inference_pipeline_with_arch(device, None);
+}
 
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    if input.trim() == "7" {
-        if let Err(e) = emg_ml_pipeline::lda::run_lda_svm_realtime_inference() {
-            eprintln!("❌ 4D LDA & SVM 실시간 추론 에러: {}", e);
+fn run_inference_pipeline_with_arch(device: &WgpuDevice, arch_override: Option<ModelArchitecture>) {
+    let arch = if let Some(a) = arch_override {
+        println!("\n🚀 [{}] 모델로 실시간 추론을 시작합니다.", a.display_name());
+        a
+    } else {
+        println!("\n[추론에 사용할 모델 선택]");
+        println!("  [1] MLP (emg_mlp_model.mpk) [1프레임 초고속 즉시추론]");
+        println!("  [2] 🚀 Block-MLP (emg_modular_mlp_model.mpk) [🥇 업그레이드 추천! O(1) 링버퍼(T=8) + Temporal-SwiGLU 블록 신경망]");
+        println!("  [3] 1D-TCN (emg_tcn_model.mpk)");
+        println!("  [4] 1D-CNN (emg_cnn_model.mpk)");
+        println!("  [5] LSTM (emg_lstm_model.mpk)");
+        println!("  [6] CNN + LSTM (emg_cnnlstm_model.mpk)");
+        println!("  [7] 4D LDA + SVM (emg_svm_model.json) [⚡ 4차원 판별 & 각 손가락 % 실시간 출력]");
+        print!("선택 (1-7, 기본 2: 업그레이드 Block-MLP) > ");
+        io::stdout().flush().unwrap();
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        if input.trim() == "7" {
+            if let Err(e) = emg_ml_pipeline::lda::run_lda_svm_realtime_inference() {
+                eprintln!("❌ 4D LDA & SVM 실시간 추론 에러: {}", e);
+            }
+            return;
         }
-        return;
-    }
 
-    let arch = match input.trim() {
-        "1" => ModelArchitecture::Mlp,
-        "2" | "" => ModelArchitecture::ModularMlp,
-        "3" => ModelArchitecture::Tcn,
-        "4" => ModelArchitecture::Cnn,
-        "5" => ModelArchitecture::Lstm,
-        "6" => ModelArchitecture::CnnLstm,
-        _ => ModelArchitecture::ModularMlp,
+        match input.trim() {
+            "1" => ModelArchitecture::Mlp,
+            "2" | "" => ModelArchitecture::ModularMlp,
+            "3" => ModelArchitecture::Tcn,
+            "4" => ModelArchitecture::Cnn,
+            "5" => ModelArchitecture::Lstm,
+            "6" => ModelArchitecture::CnnLstm,
+            _ => ModelArchitecture::ModularMlp,
+        }
     };
 
 
