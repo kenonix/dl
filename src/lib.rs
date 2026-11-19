@@ -40,3 +40,43 @@ pub use visualizer::{
     EmgCsvRecord, VisualizationMode,
 };
 
+pub const SERIAL_CONFIG_FILE: &str = "serial_config.json";
+pub const DEFAULT_SERIAL_PORT: &str = "/dev/ttyACM0";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerialConfig {
+    pub port_name: String,
+}
+
+impl Default for SerialConfig {
+    fn default() -> Self {
+        Self {
+            port_name: DEFAULT_SERIAL_PORT.to_string(),
+        }
+    }
+}
+
+/// 저장된 시리얼 포트 경로를 불러옵니다. 파일이 없으면 기본값("/dev/ttyACM0")을 반환합니다.
+pub fn load_serial_port_name() -> String {
+    if let Ok(file) = std::fs::File::open(SERIAL_CONFIG_FILE) {
+        if let Ok(cfg) = serde_json::from_reader::<_, SerialConfig>(file) {
+            let trimmed = cfg.port_name.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    DEFAULT_SERIAL_PORT.to_string()
+}
+
+/// 시리얼 포트 경로를 파일("serial_config.json")에 영구 저장합니다.
+pub fn save_serial_port_name(port_name: &str) -> std::io::Result<()> {
+    let cfg = SerialConfig {
+        port_name: port_name.trim().to_string(),
+    };
+    let file = std::fs::File::create(SERIAL_CONFIG_FILE)?;
+    serde_json::to_writer_pretty(file, &cfg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    Ok(())
+}
+

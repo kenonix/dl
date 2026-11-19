@@ -36,6 +36,34 @@ enum NOTCH_FREQUENCY { NOTCH_FREQ_50HZ = 50, NOTCH_FREQ_60HZ = 60 };
 
 enum SAMPLE_FREQUENCY { SAMPLE_FREQ_500HZ = 500, SAMPLE_FREQ_1000HZ = 1000 };
 
+enum FILTER_TYPE {
+    FILTER_TYPE_LOWPASS = 0,
+    FILTER_TYPE_HIGHPASS,
+};
+
+class FILTER_2nd {
+  private:
+    float states[2];
+    float num[3];
+    float den[3];
+
+  public:
+    void init(FILTER_TYPE ftype, int sampleFreq);
+    float update(float input);
+};
+
+class FILTER_4th {
+  private:
+    float states[4];
+    float num[6];
+    float den[6];
+    float gain;
+
+  public:
+    void init(int sampleFreq, int humFreq);
+    float update(float input);
+};
+
 // \brief EMGFilter provides an anti-hum notch filter to filter out 50HZ or
 //        60HZ power line noise, a lowpass filter to filter out signals above
 //        150HZ, and a highpass filter to filter out noise below 20HZ;
@@ -71,6 +99,10 @@ class EMGFilters {
     bool             m_notchFilterEnabled;
     bool             m_lowpassFilterEnabled;
     bool             m_highpassFilterEnabled;
+    // 채널별 독립 필터 상태 (다채널 DC 오프셋 간섭 원천 차단)
+    FILTER_2nd       m_lpf;
+    FILTER_2nd       m_hpf;
+    FILTER_4th       m_ahf;
 };
 
 #endif

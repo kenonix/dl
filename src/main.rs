@@ -38,8 +38,10 @@ fn main() {
     let device = WgpuDevice::default();
 
     loop {
+        let current_port = emg_ml_pipeline::load_serial_port_name();
         println!("\n========================================================");
         println!(" 🦾 EMG 고성능 딥러닝 & 지표 추출 파이프라인 (Burn 0.16)");
+        println!(" 🔌 현재 시리얼 포트: {}", current_port);
         println!("========================================================");
         println!(" 1. 📥 데이터 수집 (원시값 + FFT + 시간도메인 75차원 동시 저장)");
         println!(" 2. 🧠 로컬 모델 학습 (MLP / 🚀Block-MLP(SwiGLU) / 1D-TCN / 1D-CNN / LSTM / CNN+LSTM)");
@@ -52,8 +54,9 @@ fn main() {
         println!(" 9. 📊 데이터셋 종합 품질 분석기 (Quality Assessor)");
         println!(" 10. 🏛️ 메인(베이스) 모델 학습 및 영구 백업 (11/08 + 11/10 멀티 피험자 통합)");
         println!(" 11. ⚡ 현장 시연용 1세트 초고속 SFT 파인튜닝 & 즉시 실시간 시연");
-        println!(" 12. 🚪 프로그램 종료");
-        print!("메뉴를 선택하세요 (1-12) > ");
+        println!(" 12. 🔌 시리얼 포트 변경/설정 (현재: {} -> ESP32 /dev/ttyUSB0 등)", current_port);
+        println!(" 13. 🚪 프로그램 종료");
+        print!("메뉴를 선택하세요 (1-13) > ");
         io::stdout().flush().unwrap();
 
         let mut input = String::new();
@@ -112,15 +115,79 @@ fn main() {
                 }
             }
             "12" => {
+                if let Err(e) = configure_serial_port_menu() {
+                    eprintln!("❌ 시리얼 포트 설정 에러: {}", e);
+                }
+            }
+            "13" => {
                 println!("프로그램을 종료합니다.");
                 break;
             }
             _ => {
-                println!("❌ 올바른 번호를 입력하세요 (1~12)");
+                println!("❌ 올바른 번호를 입력하세요 (1~13)");
             }
         }
 
     }
+}
+
+/// 🔌 [시리얼 포트 설정 및 영구 저장 메뉴]
+fn configure_serial_port_menu() -> io::Result<()> {
+    let current_port = emg_ml_pipeline::load_serial_port_name();
+    println!("\n========================================================");
+    println!(" 🔌 [시리얼 포트 설정 및 영구 저장 (serial_config.json)]");
+    println!("========================================================");
+    println!(" 현재 저장된 포트: {}", current_port);
+
+    let available = serialport::available_ports().unwrap_or_default();
+    if available.is_empty() {
+        println!("\n ⚠️ 연결된 시리얼 포트가 자동 감지되지 않았습니다.");
+    } else {
+        println!("\n [현재 PC에 연결된 시리얼 포트 목록]");
+        for (i, p) in available.iter().enumerate() {
+            let desc = match &p.port_type {
+                serialport::SerialPortType::UsbPort(info) => {
+                    let prod = info.product.as_deref().unwrap_or("USB Serial");
+                    format!(" ({})", prod)
+                }
+                _ => String::new(),
+            };
+            println!("  [{}] {}{}", i + 1, p.port_name, desc);
+        }
+    }
+
+    println!("\n 💡 목록 번호(예: 1)를 입력하거나, 포트 경로를 직접 입력하세요.");
+    println!("    (예: /dev/ttyUSB0, /dev/ttyACM0 | 취소하려면 Enter)");
+    print!("입력 > ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        println!("설정을 변경하지 않고 돌아갑니다.");
+        return Ok(());
+    }
+
+    let new_port = if let Ok(idx) = trimmed.parse::<usize>() {
+        if idx > 0 && idx <= available.len() {
+            available[idx - 1].port_name.clone()
+        } else {
+            println!("❌ 잘못된 번호입니다.");
+            return Ok(());
+        }
+    } else {
+        trimmed.to_string()
+    };
+
+    emg_ml_pipeline::save_serial_port_name(&new_port)?;
+    println!(
+        "✔ 시리얼 포트가 '{}'로 변경되어 '{}'에 영구 저장되었습니다!",
+        new_port,
+        emg_ml_pipeline::SERIAL_CONFIG_FILE
+    );
+    Ok(())
 }
 
 // =========================================================================
@@ -242,11 +309,11 @@ fn run_sensor_diagnostic_on_stream<R: BufRead>(reader: &mut R) -> io::Result<boo
 }
 
 fn run_standalone_sensor_diagnostic() -> io::Result<()> {
-    let port_name = "/dev/ttyACM0";
+    let port_name = emg_ml_pipeline::load_serial_port_name();
     let baud_rate = 9600;
 
     println!("\n시리얼 포트 연결 중: {}...", port_name);
-    let port = serialport::new(port_name, baud_rate)
+    let port = serialport::new(&port_name, baud_rate)
         .timeout(Duration::from_millis(500))
         .open()
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
@@ -353,11 +420,11 @@ fn run_data_collection() -> io::Result<()> {
     let total_cycles: usize = cycles_input.trim().parse::<usize>().unwrap_or(6).max(1);
     println!(" ✔ 총 {}세트 순환 녹화로 설정되었습니다.\n", total_cycles);
 
-    let port_name = "/dev/ttyACM0";
+    let port_name = emg_ml_pipeline::load_serial_port_name();
     let baud_rate = 9600;
 
     println!("\n시리얼 포트 연결 중: {}...", port_name);
-    let port = serialport::new(port_name, baud_rate)
+    let port = serialport::new(&port_name, baud_rate)
         .timeout(Duration::from_millis(1000))
         .open()
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
@@ -889,11 +956,11 @@ fn record_single_sft_set() -> io::Result<String> {
     println!("   3. 주먹 지속 유지 (Sustained Fist): 9초 (카운트다운 후 주먹을 꽉 쥐고 끝까지 유지!)");
     println!("--------------------------------------------------------");
 
-    let port_name = "/dev/ttyACM0";
+    let port_name = emg_ml_pipeline::load_serial_port_name();
     let baud_rate = 9600;
 
     println!("시리얼 포트 연결 중: {}...", port_name);
-    let port = serialport::new(port_name, baud_rate)
+    let port = serialport::new(&port_name, baud_rate)
         .timeout(Duration::from_millis(1000))
         .open()
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
@@ -1670,11 +1737,11 @@ fn run_inference_pipeline_with_arch(device: &WgpuDevice, arch_override: Option<M
 
     println!("✔ {} 모델 로드 완료!", arch.display_name());
 
-    let port_name = "/dev/ttyACM0";
+    let port_name = emg_ml_pipeline::load_serial_port_name();
     let baud_rate = 9600;
 
     println!("시리얼 포트 연결 중: {}...", port_name);
-    let port = match serialport::new(port_name, baud_rate)
+    let port = match serialport::new(&port_name, baud_rate)
         .timeout(Duration::from_millis(500))
         .open()
     {

@@ -60,131 +60,102 @@ static float ahf_denominator_coef_60Hz[2][6] = {
     {1.0000, -1.8407, 0.9894, 1.0000, -1.8584, 0.9891}};
 static float ahf_output_gain_coef_60Hz[2] = {1.3430, 1.4206};
 
-enum FILTER_TYPE {
-    FILTER_TYPE_LOWPASS = 0,
-    FILTER_TYPE_HIGHPASS,
-};
-
-class FILTER_2nd {
-  private:
-    // second-order filter
-    float states[2];
-    float num[3];
-    float den[3];
-
-  public:
-    void init(FILTER_TYPE ftype, int sampleFreq) {
-        states[0] = 0;
-        states[1] = 0;
-        if (ftype == FILTER_TYPE_LOWPASS) {
-            // 2th order butterworth lowpass filter
-            // cutoff frequency 150Hz
-            if (sampleFreq == SAMPLE_FREQ_500HZ) {
-                for (int i = 0; i < 3; i++) {
-                    num[i] = lpf_numerator_coef[0][i];
-                    den[i] = lpf_denominator_coef[0][i];
-                }
-            } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
-                for (int i = 0; i < 3; i++) {
-                    num[i] = lpf_numerator_coef[1][i];
-                    den[i] = lpf_denominator_coef[1][i];
-                }
+void FILTER_2nd::init(FILTER_TYPE ftype, int sampleFreq) {
+    states[0] = 0;
+    states[1] = 0;
+    if (ftype == FILTER_TYPE_LOWPASS) {
+        // 2th order butterworth lowpass filter
+        // cutoff frequency 150Hz
+        if (sampleFreq == SAMPLE_FREQ_500HZ) {
+            for (int i = 0; i < 3; i++) {
+                num[i] = lpf_numerator_coef[0][i];
+                den[i] = lpf_denominator_coef[0][i];
             }
-        } else if (ftype == FILTER_TYPE_HIGHPASS) {
-            // 2th order butterworth
-            // cutoff frequency 20Hz
-            if (sampleFreq == SAMPLE_FREQ_500HZ) {
-                for (int i = 0; i < 3; i++) {
-                    num[i] = hpf_numerator_coef[0][i];
-                    den[i] = hpf_denominator_coef[0][i];
-                }
-            } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
-                for (int i = 0; i < 3; i++) {
-                    num[i] = hpf_numerator_coef[1][i];
-                    den[i] = hpf_denominator_coef[1][i];
-                }
+        } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
+            for (int i = 0; i < 3; i++) {
+                num[i] = lpf_numerator_coef[1][i];
+                den[i] = lpf_denominator_coef[1][i];
+            }
+        }
+    } else if (ftype == FILTER_TYPE_HIGHPASS) {
+        // 2th order butterworth
+        // cutoff frequency 20Hz
+        if (sampleFreq == SAMPLE_FREQ_500HZ) {
+            for (int i = 0; i < 3; i++) {
+                num[i] = hpf_numerator_coef[0][i];
+                den[i] = hpf_denominator_coef[0][i];
+            }
+        } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
+            for (int i = 0; i < 3; i++) {
+                num[i] = hpf_numerator_coef[1][i];
+                den[i] = hpf_denominator_coef[1][i];
             }
         }
     }
+}
 
-    float update(float input) {
-        float tmp = (input - den[1] * states[0] - den[2] * states[1]) / den[0];
-        float output = num[0] * tmp + num[1] * states[0] + num[2] * states[1];
-        // save last states
-        states[1] = states[0];
-        states[0] = tmp;
-        return output;
+float FILTER_2nd::update(float input) {
+    float tmp = (input - den[1] * states[0] - den[2] * states[1]) / den[0];
+    float output = num[0] * tmp + num[1] * states[0] + num[2] * states[1];
+    // save last states
+    states[1] = states[0];
+    states[0] = tmp;
+    return output;
+}
+
+void FILTER_4th::init(int sampleFreq, int humFreq) {
+    gain = 0;
+    for (int i = 0; i < 4; i++) {
+        states[i] = 0;
     }
-};
-
-class FILTER_4th {
-  private:
-    // fourth-order filter
-    // cascade two 2nd-order filters
-    float states[4];
-    float num[6];
-    float den[6];
-    float gain;
-
-  public:
-    void init(int sampleFreq, int humFreq) {
-        gain = 0;
-        for (int i = 0; i < 4; i++) {
-            states[i] = 0;
+    if (humFreq == NOTCH_FREQ_50HZ) {
+        if (sampleFreq == SAMPLE_FREQ_500HZ) {
+            for (int i = 0; i < 6; i++) {
+                num[i] = ahf_numerator_coef_50Hz[0][i];
+                den[i] = ahf_denominator_coef_50Hz[0][i];
+            }
+            gain = ahf_output_gain_coef_50Hz[0];
+        } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
+            for (int i = 0; i < 6; i++) {
+                num[i] = ahf_numerator_coef_50Hz[1][i];
+                den[i] = ahf_denominator_coef_50Hz[1][i];
+            }
+            gain = ahf_output_gain_coef_50Hz[1];
         }
-        if (humFreq == NOTCH_FREQ_50HZ) {
-            if (sampleFreq == SAMPLE_FREQ_500HZ) {
-                for (int i = 0; i < 6; i++) {
-                    num[i] = ahf_numerator_coef_50Hz[0][i];
-                    den[i] = ahf_denominator_coef_50Hz[0][i];
-                }
-                gain = ahf_output_gain_coef_50Hz[0];
-            } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
-                for (int i = 0; i < 6; i++) {
-                    num[i] = ahf_numerator_coef_50Hz[1][i];
-                    den[i] = ahf_denominator_coef_50Hz[1][i];
-                }
-                gain = ahf_output_gain_coef_50Hz[1];
+    } else if (humFreq == NOTCH_FREQ_60HZ) {
+        if (sampleFreq == SAMPLE_FREQ_500HZ) {
+            for (int i = 0; i < 6; i++) {
+                num[i] = ahf_numerator_coef_60Hz[0][i];
+                den[i] = ahf_denominator_coef_60Hz[0][i];
             }
-        } else if (humFreq == NOTCH_FREQ_60HZ) {
-            if (sampleFreq == SAMPLE_FREQ_500HZ) {
-                for (int i = 0; i < 6; i++) {
-                    num[i] = ahf_numerator_coef_60Hz[0][i];
-                    den[i] = ahf_denominator_coef_60Hz[0][i];
-                }
-                gain = ahf_output_gain_coef_60Hz[0];
-            } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
-                for (int i = 0; i < 6; i++) {
-                    num[i] = ahf_numerator_coef_60Hz[1][i];
-                    den[i] = ahf_denominator_coef_60Hz[1][i];
-                }
-                gain = ahf_output_gain_coef_60Hz[1];
+            gain = ahf_output_gain_coef_60Hz[0];
+        } else if (sampleFreq == SAMPLE_FREQ_1000HZ) {
+            for (int i = 0; i < 6; i++) {
+                num[i] = ahf_numerator_coef_60Hz[1][i];
+                den[i] = ahf_denominator_coef_60Hz[1][i];
             }
+            gain = ahf_output_gain_coef_60Hz[1];
         }
     }
+}
 
-    float update(float input) {
-        float output;
-        float stageIn;
-        float stageOut;
+float FILTER_4th::update(float input) {
+    float output;
+    float stageIn;
+    float stageOut;
 
-        stageOut  = num[0] * input + states[0];
-        states[0] = (num[1] * input + states[1]) - den[1] * stageOut;
-        states[1] = num[2] * input - den[2] * stageOut;
-        stageIn   = stageOut;
-        stageOut  = num[3] * stageOut + states[2];
-        states[2] = (num[4] * stageIn + states[3]) - den[4] * stageOut;
-        states[3] = num[5] * stageIn - den[5] * stageOut;
+    stageOut  = num[0] * input + states[0];
+    states[0] = (num[1] * input + states[1]) - den[1] * stageOut;
+    states[1] = num[2] * input - den[2] * stageOut;
+    stageIn   = stageOut;
+    stageOut  = num[3] * stageOut + states[2];
+    states[2] = (num[4] * stageIn + states[3]) - den[4] * stageOut;
+    states[3] = num[5] * stageIn - den[5] * stageOut;
 
-        output = gain * stageOut;
+    output = gain * stageOut;
 
-        return output;
-    }
-};
-
-FILTER_2nd LPF;
-FILTER_2nd HPF;
-FILTER_4th AHF;
+    return output;
+}
 
 void EMGFilters::init(SAMPLE_FREQUENCY sampleFreq,
                      NOTCH_FREQUENCY  notchFreq,
@@ -199,9 +170,9 @@ void EMGFilters::init(SAMPLE_FREQUENCY sampleFreq,
             m_bypassEnabled = false;
     }
 
-    LPF.init(FILTER_TYPE_LOWPASS, m_sampleFreq);
-    HPF.init(FILTER_TYPE_HIGHPASS, m_sampleFreq);
-    AHF.init(m_sampleFreq, m_notchFreq);
+    m_lpf.init(FILTER_TYPE_LOWPASS, m_sampleFreq);
+    m_hpf.init(FILTER_TYPE_HIGHPASS, m_sampleFreq);
+    m_ahf.init(m_sampleFreq, m_notchFreq);
 
     m_notchFilterEnabled    = enableNotchFilter;
     m_lowpassFilterEnabled  = enableLowpassFilter;
@@ -216,8 +187,7 @@ int EMGFilters::update(int inputValue) {
 
     // first notch filter
     if (m_notchFilterEnabled) {
-        // output = NTF.update(inputValue);
-        output = AHF.update(inputValue);
+        output = m_ahf.update(inputValue);
     } else {
         // notch filter bypass
         output = inputValue;
@@ -225,12 +195,12 @@ int EMGFilters::update(int inputValue) {
 
     // second low pass filter
     if (m_lowpassFilterEnabled) {
-        output = LPF.update(output);
+        output = m_lpf.update(output);
     }
 
     // third high pass filter
     if (m_highpassFilterEnabled) {
-        output = HPF.update(output);
+        output = m_hpf.update(output);
     }
 
     return output;

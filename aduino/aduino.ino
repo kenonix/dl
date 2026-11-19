@@ -1,115 +1,126 @@
-#include <Servo.h>
 #include "EMGFilters.h"
 
 /*
  * ======================================================================================
- * 🦾 5개 서보모터 동시 구동 + EMG 5채널 필터링 송신 + 실시간 제스처 피드백 스케치
+ * 🧠 [보드 1: ESP32 전용] 초청정 5채널 EMG 계측 + PC 통신 + 아두이노 트리거 출력
  * ======================================================================================
- * - 모터 구동: 표준 <Servo.h> 라이브러리 사용
- * - 동작 정의:
- *     1) 진짜 주먹 (Fist, '1' 수신): L LED(13번) 켜짐 + 5개 서보 한 번에 주먹 쥐기 (ANGLE_FIST = 0도)
- *     2) 아닌 경우 (휴식/잡음, '0' 수신): L LED(13번) 꺼짐 + 5개 서보 '반만 펴기' (ANGLE_HALF_OPEN = 90도)
+ * - PCA9685 / I2C / 서보 전원을 ESP32에서 물리적으로 100% 분리하여 EMG 노이즈 원천 차단!
+ * - 동작 방식:
+ *     1) 5채널 EMG 센서(SVP, SVN, 34, 35, 32)를 200Hz로 필터링하여 PC(Rust)로 전송
+ *     2) PC(Rust)로부터 '1'(주먹) 수신 -> 파란 LED(GPIO 2) ON + 트리거 핀(GPIO 23) HIGH(3.3V)
+ *     3) PC(Rust)로부터 '0'(휴식/잡음) 수신 -> 파란 LED(GPIO 2) OFF + 트리거 핀(GPIO 23) LOW(0V)
+ * - 아두이노 Uno 연결:
+ *     * ESP32 [P23 (GPIO 23)] ---> 아두이노 Uno [D2]
+ *     * ESP32 [GND]           <--> 아두이노 Uno [GND]
  * ======================================================================================
  */
 
-// =========================================================================
-// ⚙️ [서보모터 핀 설정]
-// - 5개 서보 신호선을 1개 핀(9번)에 묶어서 연결하신 경우: {9} (권장: 타이머 인터럽트 부하 최소화)
-// - 5개 서보를 서로 다른 핀에 각각 꽂으신 경우: {9, 10, 11, 5, 6} 처럼 해당 핀 번호들을 적으세요.
-// =========================================================================
-const int SERVO_PINS[] = {9}; // 단일 핀이면 {9}, 개별 핀이면 {9, 10, 11, 5, 6}
-const int NUM_SERVOS = sizeof(SERVO_PINS) / sizeof(SERVO_PINS[0]);
-Servo servos[NUM_SERVOS];
+#ifndef LED_BUILTIN
+  #define LED_BUILTIN 2 // ESP32 내장 파란색 LED (GPIO 2)
+#endif
+const int LED_PIN = LED_BUILTIN;
 
-// =========================================================================
-// 📐 [서보모터 동작 각도 설정 (0 ~ 180도)]
-// - ANGLE_FIST: 주먹 쥐었을 때 각도 (0도: 와이어 당김 -> 주먹 쥠)
-// - ANGLE_HALF_OPEN: 손 폈을 때 각도 (150도: 와이어 완전히 풀림 -> 손가락 펴짐)
-// ※ 서보 설치 방향에 따라 반대로 움직인다면 두 값(0과 150)을 맞바꿔주세요.
-// =========================================================================
-const int ANGLE_FIST = 0;         // 주먹 쥐기 각도 (L LED 켜질 때 -> 접힘/주먹)
-const int ANGLE_HALF_OPEN = 150;  // 손 펴기 각도 (L LED 꺼질 때 -> 와이어가 충분히 풀려 손이 펴짐!)
+// 아두이노 Uno(서보 전담 보드)로 파지 신호(1/0)를 보내는 디지털 출력 핀
+#ifdef ESP32
+  const int TRIGGER_OUT_PIN = 23; // ESP-32S 보드 오른쪽 상단 P23 / IO23 / D23
+  // 순수 ADC1 5채널 (보드 표기: SVP(36), SVN(39), P34(34), P35(35), P32(32))
+  const uint8_t pins[] = {36, 39, 34, 35, 32};
+#else
+  const int TRIGGER_OUT_PIN = 9;
+  const uint8_t pins[] = {A0, A1, A2, A3, A4};
+#endif
 
-// 핀 설정
-const int LED_PIN = LED_BUILTIN; // 13번 내장 LED (아두이노 보드의 'L' 표시등)
-const uint8_t pins[] = {A0, A1, A2, A3, A4};
 const int numPins = 5;
 EMGFilters filters[5];
 
 unsigned long lastMicros = 0;
 const unsigned long sampleInterval = 5000; // 200Hz 주기 (5000us)
 
-// 현재 서보 상태 캐시 (-1: 미설정, 0: 반만 펴짐, 1: 주먹 쥠)
-// 🚀 상태가 실제로 바뀔 때만 서보를 구동하여 불필요한 인터럽트 및 신호 노이즈 차단!
+// 현재 출력 상태 캐시 (-1: 미설정, 0: 펴기, 1: 주먹)
 int currentGripState = -1;
 
-void setGrip(bool isFist) {
+void setGripTrigger(bool isFist) {
   int targetState = isFist ? 1 : 0;
   if (currentGripState == targetState) {
-    return; // 상태 변화가 없으면 중복 실행 방지
+    return;
   }
   currentGripState = targetState;
 
   if (isFist) {
-    // 🚀 진짜 주먹 (Fist) 감지! -> L LED 켜짐 & 서보 접힘(주먹)
     digitalWrite(LED_PIN, HIGH);
-    for (int i = 0; i < NUM_SERVOS; i++) {
-      servos[i].write(ANGLE_FIST);
-    }
+    digitalWrite(TRIGGER_OUT_PIN, HIGH); // 아두이노 Uno D2 핀으로 '1' (3.3V HIGH) 전달
   } else {
-    // 💤 아닌 경우 (휴식 또는 잡음) -> L LED 꺼짐 & 서보 반만 펴기
     digitalWrite(LED_PIN, LOW);
-    for (int i = 0; i < NUM_SERVOS; i++) {
-      servos[i].write(ANGLE_HALF_OPEN);
-    }
+    digitalWrite(TRIGGER_OUT_PIN, LOW);  // 아두이노 Uno D2 핀으로 '0' (0V LOW) 전달
   }
 }
 
 void setup() {
   Serial.begin(9600);
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // 서보모터 연결 및 초기 '반만 펴기' 상태 설정
-  for (int i = 0; i < NUM_SERVOS; i++) {
-    servos[i].attach(SERVO_PINS[i]);
-    servos[i].write(ANGLE_HALF_OPEN);
-  }
+  pinMode(TRIGGER_OUT_PIN, OUTPUT);
+  digitalWrite(TRIGGER_OUT_PIN, LOW);
   currentGripState = 0;
 
-  // EMG 필터 초기화 (기존 원본과 동일)
+#ifdef ESP32
+  // ESP32 10비트(0~1023) 및 11dB 감쇠(0~3.1V) 설정 + 5채널 ADC1 명시 초기화
+  analogReadResolution(10);
+  analogSetAttenuation(ADC_11db);
+  for (int i = 0; i < numPins; i++) {
+    pinMode(pins[i], INPUT);
+    analogSetPinAttenuation(pins[i], ADC_11db);
+  }
+#endif
+
+  // EMG 필터 초기화 (60Hz 노치 + 20~150Hz 밴드패스)
   for (int i = 0; i < numPins; i++) {
     filters[i].init(SAMPLE_FREQ_500HZ, NOTCH_FREQ_60HZ, true, true, true);
   }
 }
 
 void loop() {
-  // 1. [PC로부터 AI 추론 결과 실시간 수신] (논블로킹 처리)
+  // 1. [PC로부터 AI 추론 결과 실시간 수신] (논블로킹)
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c == '1') {
-      setGrip(true);  // L LED ON + 주먹 쥐기 (0도 접힘)
+      setGripTrigger(true);  // LED ON + 트리거 핀 HIGH -> 아두이노가 주먹 쥠
     } else if (c == '0') {
-      setGrip(false); // L LED OFF + 반만 펴기 (90도)
+      setGripTrigger(false); // LED OFF + 트리거 핀 LOW -> 아두이노가 손 폄
     }
   }
 
-  // 2. [EMG 센서 필터링 및 PC 송신] (200Hz 주기 - 기존 원본 코드 100% 동일)
+  // 2. [EMG 센서 필터링 및 PC 송신] (200Hz 주기)
   unsigned long currentMicros = micros();
   if (currentMicros - lastMicros >= sampleInterval) {
     lastMicros = currentMicros;
 
     int envs[5];
     for (int i = 0; i < numPins; i++) {
-      int raw = analogRead(pins[i]);
-      raw = analogRead(pins[i]); // 멀티플렉서 안정화
+#ifdef ESP32
+      // 8x 오버샘플링으로 ESP32 고주파 ADC 스위칭 잡음 제거
+      long mvSum = 0;
+      for (int s = 0; s < 8; s++) {
+        mvSum += analogReadMilliVolts(pins[i]);
+      }
+      int mv = (int)(mvSum / 8);
+      int raw = (int)((long)mv * 1023L / 3300L);
       int filtered = filters[i].update(raw);
-      long env = (long)filtered * filtered; 
-      long scaled = env / 20; 
+      long env = (long)filtered * filtered;
+      // 3.3V -> 5V Uno 기준 스케일 정규화 (필요 시 숫자 조정 가능)
+      long scaled = env / 46;
+#else
+      int raw = analogRead(pins[i]);
+      raw = analogRead(pins[i]);
+      int filtered = filters[i].update(raw);
+      long env = (long)filtered * filtered;
+      long scaled = env / 20;
+#endif
       envs[i] = (scaled > 1023) ? 1023 : scaled;
     }
 
-    // Rust가 파싱하기 쉽도록 CSV 형태로 출력 (예: 120,45,12,5,89)
     Serial.print(envs[0]);
     Serial.print(",");
     Serial.print(envs[1]);

@@ -949,11 +949,11 @@ pub fn run_lda_svm_realtime_inference() -> Result<(), Box<dyn std::error::Error>
     println!("✔ 4D LDA 모델 로드 완료 (입력: {}D -> 판별 공간: {}D)", lda_model.feature_dim, lda_model.n_components);
     println!("✔ SVM 모델 로드 완료 (클래스: {}개 - {})", svm_model.num_classes, svm_model.class_names.join(", "));
 
-    let port_name = "/dev/ttyACM0";
+    let port_name = crate::load_serial_port_name();
     let baud_rate = 9600;
 
     println!("시리얼 포트 연결 중: {}...", port_name);
-    let port = match serialport::new(port_name, baud_rate)
+    let port = match serialport::new(&port_name, baud_rate)
         .timeout(Duration::from_millis(500))
         .open()
     {
